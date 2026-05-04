@@ -1,0 +1,33 @@
+[package]
+name = "mnemosctl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.37", features = ["bundled"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+wiremock = { version = "0.6", optional = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+
+[patch.crates-io]
+wiremock = { path = "test-support/wiremock" }
+
+[[test]]
+name = "integration_test"
+path = "tests/integration_test.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
