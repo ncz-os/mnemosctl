@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mnemosctl::{
-    Config, create_memory, format_peers, get_memory, health, import_jsonl, list_peers, pretty_json,
-    search_memories, sync_from_host,
+    Config, ImportOptions, SyncOptions, create_memory, format_peers, get_memory, health,
+    import_jsonl_with_options, list_peers, pretty_json, search_memories,
+    sync_from_host_with_options,
 };
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -40,11 +41,21 @@ enum Commands {
     /// Fetch one memory by ID.
     Get { id: String },
     /// Pull memories from a remote MNEMOS host into local sqlite.
-    SyncFrom { host: String },
+    SyncFrom {
+        host: String,
+        #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "100")]
+        progress: Option<usize>,
+    },
     /// List federation peers.
     Peers,
     /// Import newline-delimited JSON memories.
-    Import { file: PathBuf },
+    Import {
+        file: PathBuf,
+        #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "100")]
+        progress: Option<usize>,
+        #[arg(long, default_value_t = false)]
+        skip_bad: bool,
+    },
     /// Print the resolved configuration.
     Config,
 }
@@ -98,8 +109,16 @@ async fn run() -> Result<()> {
             let response = get_memory(&client, &config, &id).await?;
             println!("{}", pretty_json(&response)?);
         }
-        Commands::SyncFrom { host } => {
-            sync_from_host(&client, &config.api_key, &host).await?;
+        Commands::SyncFrom { host, progress } => {
+            sync_from_host_with_options(
+                &client,
+                &config.api_key,
+                &host,
+                SyncOptions {
+                    progress_every: progress,
+                },
+            )
+            .await?;
         }
         Commands::Peers => {
             let response = list_peers(&client, &config).await?;
@@ -107,9 +126,25 @@ async fn run() -> Result<()> {
                 println!("{line}");
             }
         }
-        Commands::Import { file } => {
-            let (success, fail) = import_jsonl(&client, &config, &file).await?;
-            println!("success={success} fail={fail}");
+        Commands::Import {
+            file,
+            progress,
+            skip_bad,
+        } => {
+            let result = import_jsonl_with_options(
+                &client,
+                &config,
+                &file,
+                ImportOptions {
+                    skip_bad,
+                    progress_every: progress,
+                },
+            )
+            .await?;
+            println!(
+                "success={} skipped_existing={} fail={}",
+                result.imported, result.skipped_existing, result.failed
+            );
         }
         Commands::Config => {
             println!("base_url={}", config.base_url);

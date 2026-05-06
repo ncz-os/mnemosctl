@@ -56,6 +56,8 @@ Fetches a single memory by ID.
 
 ```sh
 mnemosctl sync-from http://remote-mnemos:5002
+mnemosctl sync-from http://remote-mnemos:5002 --progress
+mnemosctl sync-from http://remote-mnemos:5002 --progress 500
 ```
 
 Pulls memories from a remote MNEMOS host in pages of 100 and upserts them into `~/.mnemos/mnemosctl.db`.
@@ -68,6 +70,7 @@ Lists federation peer URL and last sync time.
 
 ```sh
 mnemosctl import ./memories.jsonl
+mnemosctl import ./memories.jsonl --skip-bad --progress
 ```
 
 Imports newline-delimited JSON, posting each line to `/v1/memories` and reporting success and failure counts.
@@ -77,6 +80,14 @@ mnemosctl config
 ```
 
 Prints the resolved `base_url` and a masked API key.
+
+## Stress-tested behaviors
+
+- `sync-from --progress [N]` emits `[progress] N/TOTAL rows processed` every N processed rows. The default interval is 100 when `--progress` is present.
+- `import --progress [N]` uses the same progress format and default interval.
+- `import --skip-bad` skips malformed JSON rows, locally invalid rows, and rows that receive server-side 4xx responses, logs each skipped row, and continues.
+- `import` streams JSONL line by line and records successful imports in the local sqlite ledger by memory ID or source line hash so reruns do not duplicate already imported rows.
+- `sync-from` pulls remote memories with server-side pagination and upserts by memory ID, so reruns refresh existing rows and report zero newly inserted rows when nothing changed.
 
 ## What this replaces
 

@@ -4,6 +4,8 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::env;
+use std::error::Error;
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -36,6 +38,34 @@ struct SearchRequest<'a> {
 struct CreateRequest<'a> {
     content: &'a str,
     category: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SyncOptions {
+    pub progress_every: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SyncResult {
+    pub processed: usize,
+    pub inserted: usize,
+    pub updated: usize,
+    pub total: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ImportOptions {
+    pub skip_bad: bool,
+    pub progress_every: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ImportResult {
+    pub processed: usize,
+    pub imported: usize,
+    pub skipped_existing: usize,
+    pub failed: usize,
+    pub total: usize,
 }
 
 impl Config {
@@ -140,10 +170,20 @@ pub async fn list_peers(client: &Client, config: &Config) -> Result<Value> {
 }
 
 pub async fn sync_from_host(client: &Client, api_key: &str, host: &str) -> Result<usize> {
+    let result = sync_from_host_with_options(client, api_key, host, SyncOptions::default()).await?;
+    Ok(result.inserted)
+}
+
+pub async fn sync_from_host_with_options(
+    client: &Client,
+    api_key: &str,
+    host: &str,
+    options: SyncOptions,
+) -> Result<SyncResult> {
     let conn = open_sync_db()?;
     let host = normalize_base_url(host);
     let mut offset = 0usize;
-    let mut total = 0usize;
+    let mut result = SyncResult::default();
 
     loop {
         let page = request_json(
@@ -156,27 +196,37 @@ pub async fn sync_from_host(client: &Client, api_key: &str, host: &str) -> Resul
         .await
         .with_context(|| format!("pull memories from {host} at offset {offset}"))?;
 
+        if result.total.is_none() {
+            result.total = total_count(&page);
+        }
+
         let items = memory_items(&page);
         if items.is_empty() {
             break;
         }
 
         for item in &items {
-            upsert_memory(&conn, item).context("upsert memory into local sqlite")?;
-            total += 1;
-            if total % 500 == 0 {
-                println!("synced {total} records");
+            if upsert_memory(&conn, item).context("upsert memory into local sqlite")? {
+                result.inserted += 1;
+            } else {
+                result.updated += 1;
             }
+            result.processed += 1;
+            maybe_emit_progress(result.processed, result.total, options.progress_every);
         }
 
         if items.len() < DEFAULT_PAGE_SIZE {
             break;
         }
-        offset += DEFAULT_PAGE_SIZE;
+        offset += items.len();
     }
 
-    println!("synced {total} records total");
-    Ok(total)
+    emit_final_progress(result.processed, result.total, options.progress_every);
+    println!(
+        "synced {} new records ({} rows processed)",
+        result.inserted, result.processed
+    );
+    Ok(result)
 }
 
 pub async fn import_jsonl(
@@ -184,11 +234,26 @@ pub async fn import_jsonl(
     config: &Config,
     path: impl AsRef<Path>,
 ) -> Result<(usize, usize)> {
+    let result = import_jsonl_with_options(client, config, path, ImportOptions::default()).await?;
+    Ok((result.imported, result.failed))
+}
+
+pub async fn import_jsonl_with_options(
+    client: &Client,
+    config: &Config,
+    path: impl AsRef<Path>,
+    options: ImportOptions,
+) -> Result<ImportResult> {
     let path = path.as_ref();
+    let total = count_jsonl_rows(path)?;
     let file = File::open(path).with_context(|| format!("open JSONL file {}", path.display()))?;
     let reader = BufReader::new(file);
-    let mut success = 0usize;
-    let mut fail = 0usize;
+    let conn = open_sync_db()?;
+    let source = import_source(path);
+    let mut result = ImportResult {
+        total,
+        ..ImportResult::default()
+    };
 
     for (index, line) in reader.lines().enumerate() {
         let line =
@@ -197,17 +262,43 @@ pub async fn import_jsonl(
         if trimmed.is_empty() {
             continue;
         }
+        result.processed += 1;
+        let line_hash = stable_hash_hex(trimmed);
 
         let value: Value = match serde_json::from_str(trimmed) {
             Ok(value) => value,
             Err(error) => {
-                fail += 1;
-                eprintln!("line {} failed: invalid JSON: {error}", index + 1);
-                continue;
+                handle_bad_import_row(
+                    &mut result,
+                    options,
+                    index + 1,
+                    format!("invalid JSON: {error}"),
+                );
+                maybe_emit_progress(result.processed, Some(result.total), options.progress_every);
+                if options.skip_bad {
+                    continue;
+                }
+                break;
             }
         };
 
-        match request_json(
+        if let Err(error) = validate_import_row(&value) {
+            handle_bad_import_row(&mut result, options, index + 1, error.to_string());
+            maybe_emit_progress(result.processed, Some(result.total), options.progress_every);
+            if options.skip_bad {
+                continue;
+            }
+            break;
+        }
+
+        let input_id = memory_id(&value);
+        if import_already_recorded(&conn, input_id.as_deref(), &source, &line_hash)? {
+            result.skipped_existing += 1;
+            maybe_emit_progress(result.processed, Some(result.total), options.progress_every);
+            continue;
+        }
+
+        match request_json_result(
             authorized(
                 client
                     .post(join_url(&config.base_url, "/v1/memories"))
@@ -218,15 +309,34 @@ pub async fn import_jsonl(
         )
         .await
         {
-            Ok(_) => success += 1,
+            Ok(response) => {
+                let imported_id = input_id.or_else(|| memory_id_from_create_response(&response));
+                record_import(&conn, &source, &line_hash, imported_id.as_deref(), trimmed)?;
+                result.imported += 1;
+            }
+            Err(error) if error.is_conflict() && input_id.is_some() => {
+                record_import(&conn, &source, &line_hash, input_id.as_deref(), trimmed)?;
+                result.skipped_existing += 1;
+                eprintln!("line {} already exists: {error}", index + 1);
+            }
+            Err(error) if error.is_client_error() => {
+                handle_bad_import_row(&mut result, options, index + 1, error.to_string());
+                maybe_emit_progress(result.processed, Some(result.total), options.progress_every);
+                if options.skip_bad {
+                    continue;
+                }
+                break;
+            }
             Err(error) => {
-                fail += 1;
-                eprintln!("line {} failed: {error:#}", index + 1);
+                return Err(error).with_context(|| format!("import line {}", index + 1));
             }
         }
+
+        maybe_emit_progress(result.processed, Some(result.total), options.progress_every);
     }
 
-    Ok((success, fail))
+    emit_final_progress(result.processed, Some(result.total), options.progress_every);
+    Ok(result)
 }
 
 pub fn pretty_json(value: &Value) -> Result<String> {
@@ -251,36 +361,91 @@ fn authorized(request: RequestBuilder, config: &Config) -> RequestBuilder {
 }
 
 async fn request_json(request: RequestBuilder, context: &str) -> Result<Value> {
-    if let Some(cloned) = request.try_clone() {
-        if let Ok(built) = cloned.build() {
-            if let Some(value) = maybe_wiremock_response(&built, context)? {
-                return Ok(value);
-            }
-        }
+    request_json_result(request, context)
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+async fn request_json_result(
+    request: RequestBuilder,
+    context: &str,
+) -> std::result::Result<Value, JsonRequestError> {
+    if let Some(cloned) = request.try_clone()
+        && let Ok(built) = cloned.build()
+        && let Some(value) = maybe_wiremock_response(&built, context)?
+    {
+        return Ok(value);
     }
 
     let response = request
         .send()
         .await
-        .with_context(|| format!("{context} request failed"))?;
+        .map_err(|error| JsonRequestError::other(anyhow!("{context} request failed: {error}")))?;
     let status = response.status();
-    let body = response
-        .text()
-        .await
-        .with_context(|| format!("{context} response body read failed"))?;
+    let body = response.text().await.map_err(|error| {
+        JsonRequestError::other(anyhow!("{context} response body read failed: {error}"))
+    })?;
 
     if !status.is_success() {
-        bail!("{context} returned HTTP {status}: {body}");
+        return Err(JsonRequestError::http(context, status.as_u16(), body));
     }
 
     if body.trim().is_empty() {
         Ok(json!({}))
     } else {
-        serde_json::from_str(&body).with_context(|| format!("{context} returned invalid JSON"))
+        serde_json::from_str(&body).map_err(|error| {
+            JsonRequestError::other(anyhow!("{context} returned invalid JSON: {error}"))
+        })
     }
 }
 
-fn maybe_wiremock_response(request: &Request, context: &str) -> Result<Option<Value>> {
+#[derive(Debug)]
+struct JsonRequestError {
+    status: Option<u16>,
+    error: anyhow::Error,
+}
+
+impl JsonRequestError {
+    fn http(context: &str, status: u16, body: String) -> Self {
+        Self {
+            status: Some(status),
+            error: anyhow!("{context} returned HTTP {status}: {body}"),
+        }
+    }
+
+    fn other(error: anyhow::Error) -> Self {
+        Self {
+            status: None,
+            error,
+        }
+    }
+
+    fn is_client_error(&self) -> bool {
+        self.status
+            .is_some_and(|status| (400..500).contains(&status))
+    }
+
+    fn is_conflict(&self) -> bool {
+        self.status == Some(409)
+    }
+}
+
+impl fmt::Display for JsonRequestError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.error)
+    }
+}
+
+impl Error for JsonRequestError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
+
+fn maybe_wiremock_response(
+    request: &Request,
+    context: &str,
+) -> std::result::Result<Option<Value>, JsonRequestError> {
     let Some(host) = request.url().host_str() else {
         return Ok(None);
     };
@@ -292,12 +457,14 @@ fn maybe_wiremock_response(request: &Request, context: &str) -> Result<Option<Va
     };
 
     let key = format!("MNEMOSCTL_WIREMOCK_{id}");
-    let mocks = env::var(&key).with_context(|| format!("{context} has no mounted mock"))?;
-    let mocks: Value =
-        serde_json::from_str(&mocks).with_context(|| format!("parse {key} mock registry"))?;
+    let mocks = env::var(&key).map_err(|error| {
+        JsonRequestError::other(anyhow!("{context} has no mounted mock: {error}"))
+    })?;
+    let mocks: Value = serde_json::from_str(&mocks)
+        .map_err(|error| JsonRequestError::other(anyhow!("parse {key} mock registry: {error}")))?;
     let mocks = mocks
         .as_array()
-        .with_context(|| format!("{key} mock registry is not an array"))?;
+        .ok_or_else(|| JsonRequestError::other(anyhow!("{key} mock registry is not an array")))?;
 
     for mock in mocks {
         if wiremock_matches(mock, request) {
@@ -305,28 +472,28 @@ fn maybe_wiremock_response(request: &Request, context: &str) -> Result<Option<Va
             let status = response
                 .get("status")
                 .and_then(Value::as_u64)
-                .unwrap_or(500);
+                .unwrap_or(500) as u16;
             let body = response.get("body").and_then(Value::as_str).unwrap_or("");
 
             if !(200..300).contains(&status) {
-                bail!("{context} returned HTTP {status}: {body}");
+                return Err(JsonRequestError::http(context, status, body.to_string()));
             }
 
             return if body.trim().is_empty() {
                 Ok(Some(json!({})))
             } else {
-                serde_json::from_str(body)
-                    .map(Some)
-                    .with_context(|| format!("{context} returned invalid JSON"))
+                serde_json::from_str(body).map(Some).map_err(|error| {
+                    JsonRequestError::other(anyhow!("{context} returned invalid JSON: {error}"))
+                })
             };
         }
     }
 
-    bail!(
+    Err(JsonRequestError::other(anyhow!(
         "{context} no mock matched {} {}",
         request.method(),
         request.url().path()
-    );
+    )))
 }
 
 fn wiremock_matches(mock: &Value, request: &Request) -> bool {
@@ -383,6 +550,19 @@ fn open_sync_db() -> Result<Connection> {
             created_at TEXT NOT NULL,
             raw_json TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS imported_memories (
+            source TEXT NOT NULL,
+            source_line_hash TEXT NOT NULL,
+            memory_id TEXT,
+            imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            raw_json TEXT NOT NULL,
+            PRIMARY KEY (source, source_line_hash)
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS imported_memories_memory_id_idx
+            ON imported_memories(memory_id)
+            WHERE memory_id IS NOT NULL;
         ",
     )
     .context("initialize sqlite schema")?;
@@ -394,7 +574,7 @@ fn sync_db_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".mnemos").join("mnemosctl.db"))
 }
 
-fn upsert_memory(conn: &Connection, memory: &Value) -> Result<()> {
+fn upsert_memory(conn: &Connection, memory: &Value) -> Result<bool> {
     let id = string_field(memory, &["id"]).context("memory is missing id")?;
     let content = string_field(memory, &["content"]).unwrap_or_default();
     let category = string_field(memory, &["category"]).unwrap_or_else(|| "facts".to_string());
@@ -402,21 +582,217 @@ fn upsert_memory(conn: &Connection, memory: &Value) -> Result<()> {
     let raw_json = serde_json::to_string(memory).context("serialize raw memory JSON")?;
 
     debug!(memory_id = %id, "upserting memory");
+    let inserted = conn
+        .execute(
+            "
+            INSERT INTO memories (id, content, category, created_at, raw_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO NOTHING
+            ",
+            params![id, content, category, created_at, raw_json],
+        )
+        .context("execute sqlite insert")?
+        == 1;
+
+    if !inserted {
+        conn.execute(
+            "
+            UPDATE memories
+            SET content = ?2,
+                category = ?3,
+                created_at = ?4,
+                raw_json = ?5
+            WHERE id = ?1
+            ",
+            params![id, content, category, created_at, raw_json],
+        )
+        .context("execute sqlite update")?;
+    }
+
+    Ok(inserted)
+}
+
+fn count_jsonl_rows(path: &Path) -> Result<usize> {
+    let file = File::open(path).with_context(|| format!("open JSONL file {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut total = 0usize;
+
+    for line in reader.lines() {
+        if !line
+            .with_context(|| format!("read JSONL file {}", path.display()))?
+            .trim()
+            .is_empty()
+        {
+            total += 1;
+        }
+    }
+
+    Ok(total)
+}
+
+fn import_source(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn validate_import_row(value: &Value) -> Result<()> {
+    if !value.is_object() {
+        bail!("row must be a JSON object");
+    }
+    if string_field(value, &["content"]).is_none() {
+        bail!("missing required field content");
+    }
+    Ok(())
+}
+
+fn handle_bad_import_row(
+    result: &mut ImportResult,
+    _options: ImportOptions,
+    line_number: usize,
+    error: String,
+) {
+    result.failed += 1;
+    eprintln!("line {line_number} failed: {error}");
+}
+
+fn import_already_recorded(
+    conn: &Connection,
+    memory_id: Option<&str>,
+    source: &str,
+    line_hash: &str,
+) -> Result<bool> {
+    if let Some(memory_id) = memory_id {
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM imported_memories WHERE memory_id = ?1",
+                params![memory_id],
+                |row| row.get(0),
+            )
+            .context("query import ledger by memory id")?;
+        if count > 0 {
+            return Ok(true);
+        }
+    }
+
+    let count: i64 = conn
+        .query_row(
+            "
+            SELECT COUNT(*)
+            FROM imported_memories
+            WHERE source = ?1 AND source_line_hash = ?2
+            ",
+            params![source, line_hash],
+            |row| row.get(0),
+        )
+        .context("query import ledger by source line")?;
+
+    Ok(count > 0)
+}
+
+fn record_import(
+    conn: &Connection,
+    source: &str,
+    line_hash: &str,
+    memory_id: Option<&str>,
+    raw_json: &str,
+) -> Result<()> {
     conn.execute(
         "
-        INSERT INTO memories (id, content, category, created_at, raw_json)
-        VALUES (?1, ?2, ?3, ?4, ?5)
-        ON CONFLICT(id) DO UPDATE SET
-            content = excluded.content,
-            category = excluded.category,
-            created_at = excluded.created_at,
-            raw_json = excluded.raw_json
+        INSERT OR IGNORE INTO imported_memories (
+            source,
+            source_line_hash,
+            memory_id,
+            raw_json
+        )
+        VALUES (?1, ?2, ?3, ?4)
         ",
-        params![id, content, category, created_at, raw_json],
+        params![source, line_hash, memory_id, raw_json],
     )
-    .context("execute sqlite upsert")?;
+    .context("record imported memory")?;
 
     Ok(())
+}
+
+fn stable_hash_hex(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn memory_id(value: &Value) -> Option<String> {
+    string_field(value, &["id", "memory_id", "memoryId"])
+}
+
+fn memory_id_from_create_response(value: &Value) -> Option<String> {
+    memory_id(value)
+        .or_else(|| value.get("memory").and_then(memory_id))
+        .or_else(|| value.get("data").and_then(memory_id))
+}
+
+fn maybe_emit_progress(processed: usize, total: Option<usize>, every: Option<usize>) {
+    let Some(every) = every.filter(|value| *value > 0) else {
+        return;
+    };
+    if processed > 0
+        && (is_multiple_of(processed, every) || total.is_some_and(|total| processed == total))
+    {
+        emit_progress(processed, total);
+    }
+}
+
+fn emit_final_progress(processed: usize, total: Option<usize>, every: Option<usize>) {
+    let Some(every) = every.filter(|value| *value > 0) else {
+        return;
+    };
+    if processed > 0 && !is_multiple_of(processed, every) {
+        emit_progress(processed, total.or(Some(processed)));
+    }
+}
+
+#[allow(clippy::manual_is_multiple_of)]
+fn is_multiple_of(value: usize, divisor: usize) -> bool {
+    value % divisor == 0
+}
+
+fn emit_progress(processed: usize, total: Option<usize>) {
+    let total = total
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    println!("[progress] {processed}/{total} rows processed");
+}
+
+fn total_count(value: &Value) -> Option<usize> {
+    usize_field(
+        value,
+        &[
+            "total",
+            "total_count",
+            "totalCount",
+            "count",
+            "total_results",
+        ],
+    )
+}
+
+fn usize_field(value: &Value, keys: &[&str]) -> Option<usize> {
+    for key in keys {
+        if let Some(field) = value.get(*key) {
+            if let Some(number) = field.as_u64() {
+                return usize::try_from(number).ok();
+            }
+            if let Some(text) = field.as_str()
+                && let Ok(number) = text.parse::<usize>()
+            {
+                return Some(number);
+            }
+        }
+    }
+    None
 }
 
 fn load_file_config() -> Result<FileConfig> {
@@ -502,9 +878,5 @@ fn join_url(base: &str, path: &str) -> String {
 
 fn mask_api_key(value: &str) -> String {
     let prefix: String = value.chars().take(8).collect();
-    if value.chars().count() <= 8 {
-        format!("{prefix}...")
-    } else {
-        format!("{prefix}...")
-    }
+    format!("{prefix}...")
 }
