@@ -2,4 +2,4 @@
 # 1.86 is the floor required by transitive deps (icu_properties 2.2,
 # idna_adapter 1.2). Bumped from the original 1.85 pin so cargo build
 # works on stock toolchains as of 2026-05.
-channel = "1.86"
+channel = "1.94.1"
