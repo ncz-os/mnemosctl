@@ -8,6 +8,8 @@ use std::error::Error;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
@@ -537,10 +539,12 @@ fn open_sync_db() -> Result<Connection> {
     let db_path = sync_db_path()?;
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        ensure_private_dir(parent)?;
     }
 
     let conn = Connection::open(&db_path)
         .with_context(|| format!("open sqlite database {}", db_path.display()))?;
+    ensure_private_file(&db_path)?;
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS memories (
@@ -802,7 +806,12 @@ fn load_file_config() -> Result<FileConfig> {
     }
 
     let content = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    toml::from_str(&content).with_context(|| format!("parse {}", path.display()))
+    let config: FileConfig =
+        toml::from_str(&content).with_context(|| format!("parse {}", path.display()))?;
+    if config.api_key.clone().and_then(non_empty).is_some() {
+        validate_secret_file_permissions(&path)?;
+    }
+    Ok(config)
 }
 
 fn config_path() -> Result<PathBuf> {
@@ -877,6 +886,114 @@ fn join_url(base: &str, path: &str) -> String {
 }
 
 fn mask_api_key(value: &str) -> String {
-    let prefix: String = value.chars().take(8).collect();
-    format!("{prefix}...")
+    let chars: Vec<char> = value.chars().collect();
+    match chars.len() {
+        0..=8 => "********".to_string(),
+        9..=16 => {
+            let prefix: String = chars.iter().take(2).collect();
+            let suffix: String = chars.iter().skip(chars.len() - 2).collect();
+            format!("{prefix}...{suffix}")
+        }
+        _ => {
+            let prefix: String = chars.iter().take(4).collect();
+            let suffix: String = chars.iter().skip(chars.len() - 4).collect();
+            format!("{prefix}...{suffix}")
+        }
+    }
+}
+
+fn validate_secret_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let mode = fs::metadata(path)
+            .with_context(|| format!("stat {}", path.display()))?
+            .permissions()
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            bail!(
+                "{} contains api_key but is group/world accessible ({mode:o}); run: chmod 600 {}",
+                path.display(),
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ensure_private_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 700 {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn ensure_private_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 600 {}", path.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn masks_short_api_keys_without_revealing_them() {
+        assert_eq!(mask_api_key("short"), "********");
+        assert_eq!(mask_api_key("12345678"), "********");
+        assert_eq!(mask_api_key("1234567890"), "12...90");
+        assert_eq!(mask_api_key("abcdefghijklmnopqrstuvwxyz"), "abcd...wxyz");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_group_readable_config_with_api_key() -> Result<()> {
+        let dir = temp_test_dir("mnemosctl-config-perms")?;
+        let path = dir.join("config.toml");
+        fs::write(
+            &path,
+            "base_url = \"http://localhost:5002\"\napi_key = \"secret\"\n",
+        )?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+
+        let error = validate_secret_file_permissions(&path)
+            .expect_err("group-readable secret config should fail")
+            .to_string();
+
+        let _ = fs::remove_dir_all(&dir);
+        assert!(error.contains("chmod 600"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_owner_only_config_with_api_key() -> Result<()> {
+        let dir = temp_test_dir("mnemosctl-config-private")?;
+        let path = dir.join("config.toml");
+        fs::write(&path, "api_key = \"secret\"\n")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+
+        validate_secret_file_permissions(&path)?;
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn temp_test_dir(prefix: &str) -> Result<PathBuf> {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("clock before unix epoch")?
+            .as_nanos();
+        let dir = env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
 }
