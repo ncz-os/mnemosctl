@@ -74,6 +74,14 @@ impl Config {
     pub fn load() -> Result<Self> {
         let env_base_url = env::var("MNEMOS_BASE").ok().and_then(non_empty);
         let env_api_key = env::var("MNEMOS_API_KEY").ok().and_then(non_empty);
+
+        if let (Some(base_url), Some(api_key)) = (&env_base_url, &env_api_key) {
+            return Ok(Self {
+                base_url: normalize_base_url(base_url),
+                api_key: api_key.clone(),
+            });
+        }
+
         let file_config = load_file_config().context("read ~/.mnemos/config.toml")?;
 
         let base_url = env_base_url
@@ -280,7 +288,7 @@ pub async fn import_jsonl_with_options(
                 if options.skip_bad {
                     continue;
                 }
-                break;
+                bail!("import line {}: invalid JSON: {error}", index + 1);
             }
         };
 
@@ -290,7 +298,7 @@ pub async fn import_jsonl_with_options(
             if options.skip_bad {
                 continue;
             }
-            break;
+            return Err(error).with_context(|| format!("import line {}", index + 1));
         }
 
         let input_id = memory_id(&value);
@@ -312,7 +320,7 @@ pub async fn import_jsonl_with_options(
         .await
         {
             Ok(response) => {
-                let imported_id = input_id.or_else(|| memory_id_from_create_response(&response));
+                let imported_id = imported_memory_id(input_id, &response);
                 record_import(&conn, &source, &line_hash, imported_id.as_deref(), trimmed)?;
                 result.imported += 1;
             }
@@ -321,13 +329,13 @@ pub async fn import_jsonl_with_options(
                 result.skipped_existing += 1;
                 eprintln!("line {} already exists: {error}", index + 1);
             }
-            Err(error) if error.is_client_error() => {
+            Err(error) if error.is_bad_import_row() => {
                 handle_bad_import_row(&mut result, options, index + 1, error.to_string());
                 maybe_emit_progress(result.processed, Some(result.total), options.progress_every);
                 if options.skip_bad {
                     continue;
                 }
-                break;
+                return Err(error).with_context(|| format!("import line {}", index + 1));
             }
             Err(error) => {
                 return Err(error).with_context(|| format!("import line {}", index + 1));
@@ -422,9 +430,8 @@ impl JsonRequestError {
         }
     }
 
-    fn is_client_error(&self) -> bool {
-        self.status
-            .is_some_and(|status| (400..500).contains(&status))
+    fn is_bad_import_row(&self) -> bool {
+        matches!(self.status, Some(400 | 422))
     }
 
     fn is_conflict(&self) -> bool {
@@ -582,7 +589,8 @@ fn upsert_memory(conn: &Connection, memory: &Value) -> Result<bool> {
     let id = string_field(memory, &["id"]).context("memory is missing id")?;
     let content = string_field(memory, &["content"]).unwrap_or_default();
     let category = string_field(memory, &["category"]).unwrap_or_else(|| "facts".to_string());
-    let created_at = string_field(memory, &["created_at", "createdAt"]).unwrap_or_default();
+    let created_at =
+        string_field(memory, &["created", "created_at", "createdAt"]).unwrap_or_default();
     let raw_json = serde_json::to_string(memory).context("serialize raw memory JSON")?;
 
     debug!(memory_id = %id, "upserting memory");
@@ -736,6 +744,10 @@ fn memory_id_from_create_response(value: &Value) -> Option<String> {
     memory_id(value)
         .or_else(|| value.get("memory").and_then(memory_id))
         .or_else(|| value.get("data").and_then(memory_id))
+}
+
+fn imported_memory_id(input_id: Option<String>, response: &Value) -> Option<String> {
+    memory_id_from_create_response(response).or(input_id)
 }
 
 fn maybe_emit_progress(processed: usize, total: Option<usize>, every: Option<usize>) {
@@ -950,6 +962,84 @@ mod tests {
         assert_eq!(mask_api_key("12345678"), "********");
         assert_eq!(mask_api_key("1234567890"), "12...90");
         assert_eq!(mask_api_key("abcdefghijklmnopqrstuvwxyz"), "abcd...wxyz");
+    }
+
+    #[test]
+    fn import_ledger_prefers_server_generated_id() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "
+            CREATE TABLE imported_memories (
+                source TEXT NOT NULL,
+                source_line_hash TEXT NOT NULL,
+                memory_id TEXT,
+                imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                raw_json TEXT NOT NULL,
+                PRIMARY KEY (source, source_line_hash)
+            );
+            CREATE UNIQUE INDEX imported_memories_memory_id_idx
+                ON imported_memories(memory_id)
+                WHERE memory_id IS NOT NULL;
+            ",
+        )?;
+        let imported_id = imported_memory_id(
+            Some("legacy-1".to_string()),
+            &json!({"id": "mem_generated_a"}),
+        );
+
+        record_import(&conn, "file-a", "hash-a", imported_id.as_deref(), "{}")?;
+
+        assert!(!import_already_recorded(
+            &conn,
+            Some("legacy-1"),
+            "file-b",
+            "hash-b"
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn only_row_validation_statuses_are_skippable() {
+        for status in [400, 422] {
+            assert!(JsonRequestError::http("import", status, String::new()).is_bad_import_row());
+        }
+        for status in [401, 403, 408, 409, 429] {
+            assert!(!JsonRequestError::http("import", status, String::new()).is_bad_import_row());
+        }
+    }
+
+    #[test]
+    fn sync_uses_created_wire_field() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "
+            CREATE TABLE memories (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                category TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                raw_json TEXT NOT NULL
+            );
+            ",
+        )?;
+
+        upsert_memory(
+            &conn,
+            &json!({
+                "id": "mem-1",
+                "content": "content",
+                "category": "facts",
+                "created": "2026-08-10T12:00:00Z"
+            }),
+        )?;
+
+        let created_at: String = conn.query_row(
+            "SELECT created_at FROM memories WHERE id = 'mem-1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(created_at, "2026-08-10T12:00:00Z");
+        Ok(())
     }
 
     #[cfg(unix)]

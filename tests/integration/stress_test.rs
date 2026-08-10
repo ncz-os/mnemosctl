@@ -82,11 +82,11 @@ async fn import_resumes_after_bad_row_with_skip_bad() -> Result<()> {
     let file_path = temp_dir.path().join("memories.jsonl");
     let expected_ids = write_jsonl(&file_path, &namespace, 100, Some(50))?;
 
-    let first_result =
-        import_jsonl_with_options(&client, &config, &file_path, ImportOptions::default()).await?;
-    assert_eq!(first_result.imported, 49);
-    assert_eq!(first_result.failed, 1);
-    assert_eq!(first_result.processed, 50);
+    let first_error =
+        import_jsonl_with_options(&client, &config, &file_path, ImportOptions::default())
+            .await
+            .expect_err("non-skip import should report the bad row");
+    assert!(first_error.to_string().contains("import line 50"));
 
     let found_after_first = memory_ids_for_namespace(&client, &config, &namespace, 150).await?;
     assert_eq!(found_after_first.len(), 49);
