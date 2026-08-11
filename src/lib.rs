@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client, Request, RequestBuilder};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::env;
@@ -302,7 +302,8 @@ pub async fn import_jsonl_with_options(
         }
 
         let input_id = memory_id(&value);
-        if import_already_recorded(&conn, input_id.as_deref(), &source, &line_hash)? {
+        let has_input_id = input_id.is_some();
+        if import_already_recorded(&conn, &source, &line_hash)? {
             result.skipped_existing += 1;
             maybe_emit_progress(result.processed, Some(result.total), options.progress_every);
             continue;
@@ -320,12 +321,23 @@ pub async fn import_jsonl_with_options(
         .await
         {
             Ok(response) => {
-                let imported_id = imported_memory_id(input_id, &response);
-                record_import(&conn, &source, &line_hash, imported_id.as_deref(), trimmed)?;
-                result.imported += 1;
+                let imported_id = imported_memory_id(input_id, &response.value);
+                let recorded =
+                    record_import(&conn, &source, &line_hash, imported_id.as_deref(), trimmed)?;
+                if response.status == 200 {
+                    result.skipped_existing += 1;
+                } else if recorded {
+                    result.imported += 1;
+                } else {
+                    result.skipped_existing += 1;
+                }
             }
-            Err(error) if error.is_conflict() && input_id.is_some() => {
-                record_import(&conn, &source, &line_hash, input_id.as_deref(), trimmed)?;
+            Err(error)
+                if (options.skip_bad || has_input_id)
+                    && error.duplicate_existing_id().is_some() =>
+            {
+                let existing_id = error.duplicate_existing_id();
+                record_import(&conn, &source, &line_hash, existing_id.as_deref(), trimmed)?;
                 result.skipped_existing += 1;
                 eprintln!("line {} already exists: {error}", index + 1);
             }
@@ -373,13 +385,20 @@ fn authorized(request: RequestBuilder, config: &Config) -> RequestBuilder {
 async fn request_json(request: RequestBuilder, context: &str) -> Result<Value> {
     request_json_result(request, context)
         .await
+        .map(|response| response.value)
         .map_err(anyhow::Error::from)
+}
+
+#[derive(Debug)]
+struct JsonResponse {
+    status: u16,
+    value: Value,
 }
 
 async fn request_json_result(
     request: RequestBuilder,
     context: &str,
-) -> std::result::Result<Value, JsonRequestError> {
+) -> std::result::Result<JsonResponse, JsonRequestError> {
     if let Some(cloned) = request.try_clone()
         && let Ok(built) = cloned.build()
         && let Some(value) = maybe_wiremock_response(&built, context)?
@@ -401,17 +420,26 @@ async fn request_json_result(
     }
 
     if body.trim().is_empty() {
-        Ok(json!({}))
-    } else {
-        serde_json::from_str(&body).map_err(|error| {
-            JsonRequestError::other(anyhow!("{context} returned invalid JSON: {error}"))
+        Ok(JsonResponse {
+            status: status.as_u16(),
+            value: json!({}),
         })
+    } else {
+        serde_json::from_str(&body)
+            .map_err(|error| {
+                JsonRequestError::other(anyhow!("{context} returned invalid JSON: {error}"))
+            })
+            .map(|value| JsonResponse {
+                status: status.as_u16(),
+                value,
+            })
     }
 }
 
 #[derive(Debug)]
 struct JsonRequestError {
     status: Option<u16>,
+    body: Option<String>,
     error: anyhow::Error,
 }
 
@@ -419,6 +447,7 @@ impl JsonRequestError {
     fn http(context: &str, status: u16, body: String) -> Self {
         Self {
             status: Some(status),
+            body: Some(body.clone()),
             error: anyhow!("{context} returned HTTP {status}: {body}"),
         }
     }
@@ -426,16 +455,23 @@ impl JsonRequestError {
     fn other(error: anyhow::Error) -> Self {
         Self {
             status: None,
+            body: None,
             error,
         }
     }
 
     fn is_bad_import_row(&self) -> bool {
-        matches!(self.status, Some(400 | 422))
+        matches!(self.status, Some(400 | 413 | 422))
     }
 
-    fn is_conflict(&self) -> bool {
-        self.status == Some(409)
+    fn duplicate_existing_id(&self) -> Option<String> {
+        if self.status != Some(409) {
+            return None;
+        }
+        let body: Value = serde_json::from_str(self.body.as_deref()?).ok()?;
+        (body.get("error").and_then(Value::as_str) == Some("duplicate_content"))
+            .then(|| string_field(&body, &["existing_id"]))
+            .flatten()
     }
 }
 
@@ -454,7 +490,7 @@ impl Error for JsonRequestError {
 fn maybe_wiremock_response(
     request: &Request,
     context: &str,
-) -> std::result::Result<Option<Value>, JsonRequestError> {
+) -> std::result::Result<Option<JsonResponse>, JsonRequestError> {
     let Some(host) = request.url().host_str() else {
         return Ok(None);
     };
@@ -489,11 +525,16 @@ fn maybe_wiremock_response(
             }
 
             return if body.trim().is_empty() {
-                Ok(Some(json!({})))
+                Ok(Some(JsonResponse {
+                    status,
+                    value: json!({}),
+                }))
             } else {
-                serde_json::from_str(body).map(Some).map_err(|error| {
-                    JsonRequestError::other(anyhow!("{context} returned invalid JSON: {error}"))
-                })
+                serde_json::from_str(body)
+                    .map(|value| Some(JsonResponse { status, value }))
+                    .map_err(|error| {
+                        JsonRequestError::other(anyhow!("{context} returned invalid JSON: {error}"))
+                    })
             };
         }
     }
@@ -552,6 +593,12 @@ fn open_sync_db() -> Result<Connection> {
     let conn = Connection::open(&db_path)
         .with_context(|| format!("open sqlite database {}", db_path.display()))?;
     ensure_private_file(&db_path)?;
+    initialize_sync_schema(&conn)?;
+
+    Ok(conn)
+}
+
+fn initialize_sync_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS memories (
@@ -571,14 +618,36 @@ fn open_sync_db() -> Result<Connection> {
             PRIMARY KEY (source, source_line_hash)
         );
 
-        CREATE UNIQUE INDEX IF NOT EXISTS imported_memories_memory_id_idx
-            ON imported_memories(memory_id)
-            WHERE memory_id IS NOT NULL;
         ",
     )
     .context("initialize sqlite schema")?;
 
-    Ok(conn)
+    let memory_id_index_is_unique: Option<bool> = conn
+        .query_row(
+            "
+            SELECT [unique] != 0
+            FROM pragma_index_list('imported_memories')
+            WHERE name = 'imported_memories_memory_id_idx'
+            ",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("inspect import ledger memory ID index")?;
+    if memory_id_index_is_unique == Some(true) {
+        conn.execute_batch("DROP INDEX IF EXISTS imported_memories_memory_id_idx;")
+            .context("migrate import ledger memory ID index")?;
+    }
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS imported_memories_memory_id_idx
+            ON imported_memories(memory_id)
+            WHERE memory_id IS NOT NULL;
+        ",
+    )
+    .context("initialize import ledger memory ID index")?;
+
+    Ok(())
 }
 
 fn sync_db_path() -> Result<PathBuf> {
@@ -669,25 +738,7 @@ fn handle_bad_import_row(
     eprintln!("line {line_number} failed: {error}");
 }
 
-fn import_already_recorded(
-    conn: &Connection,
-    memory_id: Option<&str>,
-    source: &str,
-    line_hash: &str,
-) -> Result<bool> {
-    if let Some(memory_id) = memory_id {
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM imported_memories WHERE memory_id = ?1",
-                params![memory_id],
-                |row| row.get(0),
-            )
-            .context("query import ledger by memory id")?;
-        if count > 0 {
-            return Ok(true);
-        }
-    }
-
+fn import_already_recorded(conn: &Connection, source: &str, line_hash: &str) -> Result<bool> {
     let count: i64 = conn
         .query_row(
             "
@@ -709,22 +760,24 @@ fn record_import(
     line_hash: &str,
     memory_id: Option<&str>,
     raw_json: &str,
-) -> Result<()> {
-    conn.execute(
-        "
-        INSERT OR IGNORE INTO imported_memories (
+) -> Result<bool> {
+    let inserted = conn
+        .execute(
+            "
+        INSERT INTO imported_memories (
             source,
             source_line_hash,
             memory_id,
             raw_json
         )
         VALUES (?1, ?2, ?3, ?4)
+        ON CONFLICT(source, source_line_hash) DO NOTHING
         ",
-        params![source, line_hash, memory_id, raw_json],
-    )
-    .context("record imported memory")?;
+            params![source, line_hash, memory_id, raw_json],
+        )
+        .context("record imported memory")?;
 
-    Ok(())
+    Ok(inserted == 1)
 }
 
 fn stable_hash_hex(value: &str) -> String {
@@ -967,6 +1020,87 @@ mod tests {
     #[test]
     fn import_ledger_prefers_server_generated_id() -> Result<()> {
         let conn = Connection::open_in_memory()?;
+        initialize_sync_schema(&conn)?;
+        let imported_id = imported_memory_id(
+            Some("legacy-1".to_string()),
+            &json!({"id": "mem_generated_a"}),
+        );
+
+        record_import(&conn, "file-a", "hash-a", imported_id.as_deref(), "{}")?;
+
+        assert!(!import_already_recorded(&conn, "file-b", "hash-b")?);
+        Ok(())
+    }
+
+    #[test]
+    fn only_row_validation_statuses_are_skippable() {
+        for status in [400, 413, 422] {
+            assert!(JsonRequestError::http("import", status, String::new()).is_bad_import_row());
+        }
+        for status in [401, 403, 408, 409, 429] {
+            assert!(!JsonRequestError::http("import", status, String::new()).is_bad_import_row());
+        }
+    }
+
+    #[test]
+    fn duplicate_conflict_uses_server_existing_id() {
+        let error = JsonRequestError::http(
+            "import",
+            409,
+            json!({
+                "error": "duplicate_content",
+                "existing_id": "mem-real"
+            })
+            .to_string(),
+        );
+
+        assert_eq!(error.duplicate_existing_id().as_deref(), Some("mem-real"));
+        assert!(
+            JsonRequestError::http("import", 409, json!({"detail": "other"}).to_string())
+                .duplicate_existing_id()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn ledger_allows_multiple_source_rows_for_one_server_memory() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        initialize_sync_schema(&conn)?;
+
+        assert!(record_import(
+            &conn,
+            "file-a",
+            "hash-a",
+            Some("mem-1"),
+            "{}"
+        )?);
+        assert!(record_import(
+            &conn,
+            "file-b",
+            "hash-b",
+            Some("mem-1"),
+            "{}"
+        )?);
+        assert!(!record_import(
+            &conn,
+            "file-b",
+            "hash-b",
+            Some("mem-1"),
+            "{}"
+        )?);
+
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM imported_memories WHERE memory_id = 'mem-1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn populated_ledger_unique_index_is_migrated_in_place() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
         conn.execute_batch(
             "
             CREATE TABLE imported_memories (
@@ -980,32 +1114,20 @@ mod tests {
             CREATE UNIQUE INDEX imported_memories_memory_id_idx
                 ON imported_memories(memory_id)
                 WHERE memory_id IS NOT NULL;
+            INSERT INTO imported_memories (source, source_line_hash, memory_id, raw_json)
+                VALUES ('old-file', 'old-hash', 'mem-1', '{}');
             ",
         )?;
-        let imported_id = imported_memory_id(
-            Some("legacy-1".to_string()),
-            &json!({"id": "mem_generated_a"}),
-        );
 
-        record_import(&conn, "file-a", "hash-a", imported_id.as_deref(), "{}")?;
-
-        assert!(!import_already_recorded(
+        initialize_sync_schema(&conn)?;
+        assert!(record_import(
             &conn,
-            Some("legacy-1"),
-            "file-b",
-            "hash-b"
+            "new-file",
+            "new-hash",
+            Some("mem-1"),
+            "{}"
         )?);
         Ok(())
-    }
-
-    #[test]
-    fn only_row_validation_statuses_are_skippable() {
-        for status in [400, 422] {
-            assert!(JsonRequestError::http("import", status, String::new()).is_bad_import_row());
-        }
-        for status in [401, 403, 408, 409, 429] {
-            assert!(!JsonRequestError::http("import", status, String::new()).is_bad_import_row());
-        }
     }
 
     #[test]
