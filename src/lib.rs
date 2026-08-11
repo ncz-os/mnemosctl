@@ -3,7 +3,7 @@ use reqwest::{Client, Request, RequestBuilder};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -17,6 +17,7 @@ use std::time::Duration;
 use tracing::debug;
 
 const DEFAULT_PAGE_SIZE: usize = 100;
+const BALANCED_SEARCH_LIMIT: usize = 100;
 const MAX_SYNC_SCAN_ATTEMPTS: usize = 5;
 static MOCK_RESPONSE_HITS: LazyLock<Mutex<HashMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -136,6 +137,11 @@ pub async fn search_memories(
     namespace: Option<&str>,
     semantic: bool,
 ) -> Result<Value> {
+    if !(1..=BALANCED_SEARCH_LIMIT).contains(&limit) {
+        bail!(
+            "search limit must be between 1 and {BALANCED_SEARCH_LIMIT}; MNEMOS uses the balanced retrieval profile for this command"
+        );
+    }
     let body = SearchRequest {
         query,
         limit,
@@ -244,7 +250,7 @@ pub async fn sync_from_host_with_options(
             )
             .await
             .with_context(|| format!("pull vaulted memory {id} from {host}"))?;
-        } else if response_contains_redacted_content(&item) {
+        } else if response_has_redaction_metadata(&item) {
             let id = memory_id(&item).unwrap_or_else(|| "<unknown>".to_string());
             bail!(
                 "remote memory {id} contains redacted credential spans and cannot be stored as canonical content"
@@ -309,11 +315,19 @@ async fn scan_remote_memories(
     Ok((items, expected_total.unwrap_or(0)))
 }
 
-fn response_contains_redacted_content(memory: &Value) -> bool {
-    memory
-        .get("content")
-        .and_then(Value::as_str)
-        .is_some_and(|content| content.contains("[REDACTED]"))
+fn response_has_redaction_metadata(memory: &Value) -> bool {
+    let Some(metadata) = memory.get("metadata").and_then(Value::as_object) else {
+        return false;
+    };
+    metadata
+        .get("secret_redact_fields")
+        .and_then(|fields| fields.get("content"))
+        .and_then(Value::as_array)
+        .is_some_and(|spans| !spans.is_empty())
+        || metadata
+            .get("secret_redact_spans")
+            .and_then(Value::as_array)
+            .is_some_and(|spans| !spans.is_empty())
 }
 
 pub async fn import_jsonl(
@@ -379,28 +393,75 @@ pub async fn import_jsonl_with_options(
         }
 
         let input_id = memory_id(&value);
-        if import_already_recorded(&conn, &source, &line_hash)? {
+        if import_already_recorded(&conn, input_id.as_deref(), &line_hash, trimmed)? {
             result.skipped_existing += 1;
             maybe_emit_progress(result.processed, Some(result.total), options.progress_every);
             continue;
         }
 
-        match request_json_result(
+        let record_id = input_id
+            .clone()
+            .unwrap_or_else(|| format!("mnemosctl-{line_hash}"));
+        let use_portability = requires_portability_import(&value);
+        let request = if use_portability {
+            let envelope = portability_import_envelope(&value, &record_id)?;
+            authorized(
+                client
+                    .post(join_url(&config.base_url, "/v1/import"))
+                    .query(&[("preserve_owner", true)])
+                    .json(&envelope),
+                config,
+            )
+        } else {
             authorized(
                 client
                     .post(join_url(&config.base_url, "/v1/memories"))
                     .json(&value),
                 config,
-            ),
-            "POST /v1/memories",
-        )
-        .await
-        {
+            )
+        };
+        let request_context = if use_portability {
+            "POST /v1/import"
+        } else {
+            "POST /v1/memories"
+        };
+
+        match request_json_result(request, request_context).await {
             Ok(response) => {
-                let imported_id = imported_memory_id(input_id, &response.value);
-                let recorded =
-                    record_import(&conn, &source, &line_hash, imported_id.as_deref(), trimmed)?;
-                if response.status == 200 {
+                let (imported, skipped, failed, server_memory_id) = if use_portability {
+                    let (imported, skipped, failed) = portability_import_counts(&response.value)?;
+                    (imported, skipped, failed, Some(record_id.clone()))
+                } else {
+                    let skipped = usize::from(response.status == 200);
+                    let imported = usize::from(response.status != 200);
+                    let server_id = memory_id_from_create_response(&response.value);
+                    (imported, skipped, 0, server_id)
+                };
+                if failed > 0 || imported + skipped != 1 {
+                    let error = anyhow!(
+                        "portability import reported imported={imported} skipped={skipped} failed={failed}: {}",
+                        response.value
+                    );
+                    handle_bad_import_row(&mut result, options, index + 1, error.to_string());
+                    maybe_emit_progress(
+                        result.processed,
+                        Some(result.total),
+                        options.progress_every,
+                    );
+                    if options.skip_bad {
+                        continue;
+                    }
+                    return Err(error).with_context(|| format!("import line {}", index + 1));
+                }
+                let recorded = record_import(
+                    &conn,
+                    &source,
+                    &line_hash,
+                    input_id.as_deref(),
+                    server_memory_id.as_deref(),
+                    trimmed,
+                )?;
+                if skipped == 1 {
                     result.skipped_existing += 1;
                 } else if recorded {
                     result.imported += 1;
@@ -410,7 +471,14 @@ pub async fn import_jsonl_with_options(
             }
             Err(error) if error.duplicate_existing_id().is_some() => {
                 let existing_id = error.duplicate_existing_id();
-                record_import(&conn, &source, &line_hash, existing_id.as_deref(), trimmed)?;
+                record_import(
+                    &conn,
+                    &source,
+                    &line_hash,
+                    input_id.as_deref(),
+                    existing_id.as_deref(),
+                    trimmed,
+                )?;
                 result.skipped_existing += 1;
                 eprintln!("line {} already exists: {error}", index + 1);
             }
@@ -717,6 +785,8 @@ fn initialize_sync_schema(conn: &Connection) -> Result<()> {
             source TEXT NOT NULL,
             source_line_hash TEXT NOT NULL,
             memory_id TEXT,
+            input_memory_id TEXT,
+            server_memory_id TEXT,
             imported_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             raw_json TEXT NOT NULL,
             PRIMARY KEY (source, source_line_hash)
@@ -725,6 +795,15 @@ fn initialize_sync_schema(conn: &Connection) -> Result<()> {
         ",
     )
     .context("initialize sqlite schema")?;
+
+    add_import_ledger_column(conn, "input_memory_id", "TEXT")?;
+    add_import_ledger_column(conn, "server_memory_id", "TEXT")?;
+    conn.execute(
+        "UPDATE imported_memories SET server_memory_id = memory_id WHERE server_memory_id IS NULL",
+        [],
+    )
+    .context("migrate import ledger server memory IDs")?;
+    migrate_import_input_ids(conn)?;
 
     let memory_id_index_is_unique: Option<bool> = conn
         .query_row(
@@ -747,10 +826,79 @@ fn initialize_sync_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS imported_memories_memory_id_idx
             ON imported_memories(memory_id)
             WHERE memory_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS imported_memories_input_memory_id_idx
+            ON imported_memories(input_memory_id)
+            WHERE input_memory_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS imported_memories_server_memory_id_idx
+            ON imported_memories(server_memory_id)
+            WHERE server_memory_id IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS imported_memories_line_hash_idx
+            ON imported_memories(source_line_hash);
         ",
     )
     .context("initialize import ledger memory ID index")?;
 
+    Ok(())
+}
+
+fn add_import_ledger_column(conn: &Connection, name: &str, sql_type: &str) -> Result<()> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('imported_memories') WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .context("inspect import ledger columns")?;
+    if !exists {
+        conn.execute(
+            &format!("ALTER TABLE imported_memories ADD COLUMN {name} {sql_type}"),
+            [],
+        )
+        .with_context(|| format!("add import ledger column {name}"))?;
+    }
+    Ok(())
+}
+
+fn migrate_import_input_ids(conn: &Connection) -> Result<()> {
+    let rows = {
+        let mut statement = conn
+            .prepare(
+                "SELECT rowid, raw_json FROM imported_memories \
+                 WHERE input_memory_id IS NULL ORDER BY imported_at, rowid",
+            )
+            .context("prepare import ledger input ID migration")?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("query import ledger input IDs")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("read import ledger input IDs")?
+    };
+    let mut seen_statement = conn
+        .prepare("SELECT input_memory_id FROM imported_memories WHERE input_memory_id IS NOT NULL")
+        .context("prepare existing import input IDs")?;
+    let mut seen = seen_statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("query existing import input IDs")?
+        .collect::<rusqlite::Result<HashSet<_>>>()
+        .context("read existing import input IDs")?;
+
+    for (rowid, raw_json) in rows {
+        let Ok(value) = serde_json::from_str::<Value>(&raw_json) else {
+            continue;
+        };
+        let Some(input_id) = memory_id(&value) else {
+            continue;
+        };
+        if seen.insert(input_id.clone()) {
+            conn.execute(
+                "UPDATE imported_memories SET input_memory_id = ?1 WHERE rowid = ?2",
+                params![input_id, rowid],
+            )
+            .context("migrate import ledger input memory ID")?;
+        }
+    }
     Ok(())
 }
 
@@ -823,13 +971,125 @@ fn import_source(path: &Path) -> String {
 }
 
 fn validate_import_row(value: &Value) -> Result<()> {
-    if !value.is_object() {
+    let Some(object) = value.as_object() else {
         bail!("row must be a JSON object");
-    }
+    };
     if string_field(value, &["content"]).is_none() {
         bail!("missing required field content");
     }
+    const PORTABILITY_FIELDS: &[&str] = &[
+        "id",
+        "memory_id",
+        "memoryId",
+        "content",
+        "category",
+        "subcategory",
+        "created",
+        "updated",
+        "owner_id",
+        "namespace",
+        "permission_mode",
+        "quality_rating",
+        "metadata",
+        "source_model",
+        "source_provider",
+        "source_session",
+        "source_agent",
+        "source",
+        "verbatim_content",
+    ];
+    let unsupported = object
+        .keys()
+        .filter(|key| !PORTABILITY_FIELDS.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unsupported.is_empty() {
+        bail!(
+            "fields cannot be restored by the MNEMOS portability API: {}; refusing lossy import",
+            unsupported.join(", ")
+        );
+    }
     Ok(())
+}
+
+fn requires_portability_import(value: &Value) -> bool {
+    [
+        "id",
+        "memory_id",
+        "memoryId",
+        "created",
+        "updated",
+        "quality_rating",
+    ]
+    .iter()
+    .any(|key| value.get(*key).is_some_and(|field| !field.is_null()))
+}
+
+fn portability_import_envelope(value: &Value, record_id: &str) -> Result<Value> {
+    let object = value
+        .as_object()
+        .context("portability import row must be an object")?;
+    if object.get("source").is_some_and(|field| !field.is_null()) {
+        bail!(
+            "field source cannot be restored together with identity/timestamps by the MNEMOS portability API; refusing lossy import"
+        );
+    }
+    let mut payload = serde_json::Map::new();
+    for key in [
+        "content",
+        "category",
+        "subcategory",
+        "created",
+        "updated",
+        "owner_id",
+        "namespace",
+        "permission_mode",
+        "quality_rating",
+        "metadata",
+        "source_model",
+        "source_provider",
+        "source_session",
+        "source_agent",
+        "verbatim_content",
+    ] {
+        if let Some(field) = object.get(key)
+            && !field.is_null()
+        {
+            payload.insert(key.to_string(), field.clone());
+        }
+    }
+
+    Ok(json!({
+        "mpf_version": "0.1.1",
+        "source_system": "mnemosctl",
+        "source_version": env!("CARGO_PKG_VERSION"),
+        "record_count": 1,
+        "records": [{
+            "id": record_id,
+            "kind": "memory",
+            "payload_version": "mnemos-3.1",
+            "payload": payload,
+        }],
+    }))
+}
+
+fn portability_import_counts(value: &Value) -> Result<(usize, usize, usize)> {
+    let imported =
+        usize_field(value, &["imported"]).context("import response is missing imported")?;
+    let skipped = usize_field(value, &["skipped"]).context("import response is missing skipped")?;
+    let mut failed =
+        usize_field(value, &["failed"]).context("import response is missing failed")?;
+    for key in ["sidecars_failed", "unsupported_kinds"] {
+        if let Some(counts) = value.get(key).and_then(Value::as_object) {
+            for count in counts.values() {
+                failed += count
+                    .as_u64()
+                    .and_then(|count| usize::try_from(count).ok())
+                    .with_context(|| format!("import response {key} count is not an integer"))?;
+            }
+        }
+    }
+    Ok((imported, skipped, failed))
 }
 
 fn handle_bad_import_row(
@@ -842,18 +1102,24 @@ fn handle_bad_import_row(
     eprintln!("line {line_number} failed: {error}");
 }
 
-fn import_already_recorded(conn: &Connection, source: &str, line_hash: &str) -> Result<bool> {
+fn import_already_recorded(
+    conn: &Connection,
+    input_memory_id: Option<&str>,
+    line_hash: &str,
+    raw_json: &str,
+) -> Result<bool> {
     let count: i64 = conn
         .query_row(
             "
             SELECT COUNT(*)
             FROM imported_memories
-            WHERE source = ?1 AND source_line_hash = ?2
+            WHERE (?1 IS NOT NULL AND input_memory_id = ?1)
+               OR (source_line_hash = ?2 AND raw_json = ?3)
             ",
-            params![source, line_hash],
+            params![input_memory_id, line_hash, raw_json],
             |row| row.get(0),
         )
-        .context("query import ledger by source line")?;
+        .context("query import ledger by input identity or content")?;
 
     Ok(count > 0)
 }
@@ -862,7 +1128,8 @@ fn record_import(
     conn: &Connection,
     source: &str,
     line_hash: &str,
-    memory_id: Option<&str>,
+    input_memory_id: Option<&str>,
+    server_memory_id: Option<&str>,
     raw_json: &str,
 ) -> Result<bool> {
     let inserted = conn
@@ -872,12 +1139,20 @@ fn record_import(
             source,
             source_line_hash,
             memory_id,
+            input_memory_id,
+            server_memory_id,
             raw_json
         )
-        VALUES (?1, ?2, ?3, ?4)
+        VALUES (?1, ?2, ?4, ?3, ?4, ?5)
         ON CONFLICT(source, source_line_hash) DO NOTHING
         ",
-            params![source, line_hash, memory_id, raw_json],
+            params![
+                source,
+                line_hash,
+                input_memory_id,
+                server_memory_id,
+                raw_json
+            ],
         )
         .context("record imported memory")?;
 
@@ -901,10 +1176,6 @@ fn memory_id_from_create_response(value: &Value) -> Option<String> {
     memory_id(value)
         .or_else(|| value.get("memory").and_then(memory_id))
         .or_else(|| value.get("data").and_then(memory_id))
-}
-
-fn imported_memory_id(input_id: Option<String>, response: &Value) -> Option<String> {
-    memory_id_from_create_response(response).or(input_id)
 }
 
 fn maybe_emit_progress(processed: usize, total: Option<usize>, every: Option<usize>) {
@@ -1122,18 +1393,61 @@ mod tests {
     }
 
     #[test]
-    fn import_ledger_prefers_server_generated_id() -> Result<()> {
+    fn import_ledger_is_idempotent_across_file_paths() -> Result<()> {
         let conn = Connection::open_in_memory()?;
         initialize_sync_schema(&conn)?;
-        let imported_id = imported_memory_id(
-            Some("legacy-1".to_string()),
-            &json!({"id": "mem_generated_a"}),
-        );
+        let raw = r#"{"id":"legacy-1","content":"same"}"#;
+        record_import(
+            &conn,
+            "file-a",
+            "hash-a",
+            Some("legacy-1"),
+            Some("legacy-1"),
+            raw,
+        )?;
 
-        record_import(&conn, "file-a", "hash-a", imported_id.as_deref(), "{}")?;
-
-        assert!(!import_already_recorded(&conn, "file-b", "hash-b")?);
+        assert!(import_already_recorded(
+            &conn,
+            Some("legacy-1"),
+            "different-hash",
+            r#"{"id":"legacy-1","content":"changed"}"#,
+        )?);
+        assert!(import_already_recorded(&conn, None, "hash-a", raw)?);
         Ok(())
+    }
+
+    #[test]
+    fn portability_envelope_preserves_identity_and_timestamps() -> Result<()> {
+        let value = json!({
+            "id": "mem-old",
+            "content": "archive row",
+            "created": "2024-01-01T00:00:00Z",
+            "updated": "2024-02-01T00:00:00Z",
+            "quality_rating": 91,
+        });
+        validate_import_row(&value)?;
+        let envelope = portability_import_envelope(&value, "mem-old")?;
+        assert_eq!(envelope["records"][0]["id"], "mem-old");
+        assert_eq!(
+            envelope["records"][0]["payload"]["created"],
+            "2024-01-01T00:00:00Z"
+        );
+        assert_eq!(envelope["records"][0]["payload"]["quality_rating"], 91);
+        Ok(())
+    }
+
+    #[test]
+    fn lossy_archive_fields_are_rejected() {
+        let error = validate_import_row(&json!({
+            "id": "mem-old",
+            "content": "archive row",
+            "compressed_content": "summary",
+            "archived_at": "2025-01-01T00:00:00Z",
+        }))
+        .expect_err("unsupported archive state must not be silently discarded")
+        .to_string();
+        assert!(error.contains("archived_at"));
+        assert!(error.contains("compressed_content"));
     }
 
     #[test]
@@ -1167,14 +1481,15 @@ mod tests {
     }
 
     #[test]
-    fn sync_rejects_redacted_presentation_content() {
-        assert!(response_contains_redacted_content(&json!({
+    fn sync_uses_structured_redaction_metadata_not_a_content_sentinel() {
+        assert!(response_has_redaction_metadata(&json!({
             "id": "mem-secret",
-            "content": "token=[REDACTED]"
+            "content": "token=[REDACTED]",
+            "metadata": {"secret_redact_fields": {"content": [[6, 25]]}}
         })));
-        assert!(!response_contains_redacted_content(&json!({
-            "id": "mem-clean",
-            "content": "ordinary canonical content"
+        assert!(!response_has_redaction_metadata(&json!({
+            "id": "mem-literal",
+            "content": "Use [REDACTED] in examples"
         })));
     }
 
@@ -1187,6 +1502,7 @@ mod tests {
             &conn,
             "file-a",
             "hash-a",
+            Some("legacy-a"),
             Some("mem-1"),
             "{}"
         )?);
@@ -1194,6 +1510,7 @@ mod tests {
             &conn,
             "file-b",
             "hash-b",
+            Some("legacy-b"),
             Some("mem-1"),
             "{}"
         )?);
@@ -1201,12 +1518,13 @@ mod tests {
             &conn,
             "file-b",
             "hash-b",
+            Some("legacy-b"),
             Some("mem-1"),
             "{}"
         )?);
 
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM imported_memories WHERE memory_id = 'mem-1'",
+            "SELECT COUNT(*) FROM imported_memories WHERE server_memory_id = 'mem-1'",
             [],
             |row| row.get(0),
         )?;
@@ -1231,15 +1549,33 @@ mod tests {
                 ON imported_memories(memory_id)
                 WHERE memory_id IS NOT NULL;
             INSERT INTO imported_memories (source, source_line_hash, memory_id, raw_json)
-                VALUES ('old-file', 'old-hash', 'mem-1', '{}');
+                VALUES (
+                    'old-file',
+                    'old-hash',
+                    'mem-1',
+                    '{\"id\":\"legacy-1\",\"content\":\"old\"}'
+                );
             ",
         )?;
 
         initialize_sync_schema(&conn)?;
+        let migrated: (String, String) = conn.query_row(
+            "SELECT input_memory_id, server_memory_id FROM imported_memories",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(migrated, ("legacy-1".to_string(), "mem-1".to_string()));
+        assert!(import_already_recorded(
+            &conn,
+            Some("legacy-1"),
+            "new-hash",
+            r#"{"id":"legacy-1","content":"changed"}"#,
+        )?);
         assert!(record_import(
             &conn,
             "new-file",
             "new-hash",
+            Some("legacy-2"),
             Some("mem-1"),
             "{}"
         )?);

@@ -40,6 +40,8 @@ mnemosctl search "project notes" --limit 25 --namespace work --semantic
 ```
 
 Posts a search request to `/v1/memories/search`.
+The command uses MNEMOS's default `balanced` retrieval profile and accepts
+limits from 1 through 100, matching that profile's server-side cap.
 
 ```sh
 mnemosctl create --content "The launch checklist lives in Drive" --category facts
@@ -64,8 +66,9 @@ Pulls memories from a remote MNEMOS host in pages of 100 and upserts them into `
 The credential must have the MNEMOS `root` role because synchronization requests
 the unframed operational representation. The command completes only after two
 consecutive scans contain the same complete set of memory IDs. Vault memories
-are fetched individually; if the server redacts an incidental credential span,
-the command fails instead of storing the redacted text as canonical content.
+are fetched individually. If structured response metadata says the server
+redacted an incidental credential span, the command fails instead of storing
+the redacted text as canonical content.
 
 ```sh
 mnemosctl peers
@@ -78,7 +81,13 @@ mnemosctl import ./memories.jsonl
 mnemosctl import ./memories.jsonl --skip-bad --progress
 ```
 
-Imports newline-delimited JSON, posting each line to `/v1/memories` and reporting success and failure counts.
+Imports newline-delimited MNEMOS memory objects and reports success and failure
+counts. Ordinary create-shaped rows use the core `/v1/memories` route. Rows
+with stable IDs, timestamps, or quality state use the authoritative
+`/v1/import?preserve_owner=true` portability API, which requires CHARON and a
+root bearer token. Identity and all supported archive metadata are preserved.
+A row with fields the selected API cannot restore is rejected instead of being
+silently imported with data loss.
 
 ```sh
 mnemosctl config
@@ -95,7 +104,7 @@ All commands use finite HTTP deadlines. Override the defaults with global
 - `sync-from --progress [N]` emits `[progress] N/TOTAL rows processed` every N processed rows. The default interval is 100 when `--progress` is present.
 - `import --progress [N]` uses the same progress format and default interval.
 - `import --skip-bad` skips malformed JSON rows, locally invalid rows, and rows that receive server-side 4xx responses, logs each skipped row, and continues.
-- `import` streams JSONL line by line and records successful imports in the local sqlite ledger by memory ID or source line hash so reruns do not duplicate already imported rows.
+- `import` streams JSONL line by line and records successful imports in the local sqlite ledger by input memory ID or a path-independent line hash, so copied or moved input files remain idempotent.
 - `sync-from` pulls remote memories with server-side pagination and upserts by memory ID, so reruns refresh existing rows and report zero newly inserted rows when nothing changed.
 
 ## What this replaces

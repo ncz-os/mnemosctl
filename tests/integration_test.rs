@@ -137,15 +137,15 @@ fn import_propagates_authentication_failure_with_skip_bad() {
 }
 
 #[test]
-fn import_skip_bad_records_duplicate_server_id_and_continues() {
+fn import_records_server_skips_and_continues() {
     let temp_dir = test_temp_dir("duplicate");
     let import_path = temp_dir.join("memories.jsonl");
     fs::write(
         &import_path,
-        "{\"id\":\"legacy-1\",\"content\":\"one\"}\n{\"content\":\"two\"}\n",
+        "{\"id\":\"legacy-1\",\"content\":\"one\"}\n{\"id\":\"legacy-2\",\"content\":\"two\"}\n",
     )
     .expect("write import file");
-    let mocks = r#"[{"matchers":[{"kind":"method","value":"POST"},{"kind":"path","value":"/v1/memories"}],"response":{"status":409,"body":"{\"error\":\"duplicate_content\",\"existing_id\":\"mem-real\"}"}}]"#;
+    let mocks = r#"[{"matchers":[{"kind":"method","value":"POST"},{"kind":"path","value":"/v1/import"}],"response":{"status":200,"body":"{\"imported\":0,\"skipped\":1,\"failed\":0}"}}]"#;
 
     let output = run_import(&temp_dir, &import_path, "duplicate", mocks, true);
     assert!(
@@ -160,13 +160,15 @@ fn import_skip_bad_records_duplicate_server_id_and_continues() {
     let conn = rusqlite::Connection::open(temp_dir.join(".mnemos/mnemosctl.db"))
         .expect("open import ledger");
     let ids = conn
-        .prepare("SELECT memory_id FROM imported_memories ORDER BY source_line_hash")
+        .prepare("SELECT server_memory_id FROM imported_memories ORDER BY server_memory_id")
         .expect("prepare ledger query")
         .query_map([], |row| row.get::<_, String>(0))
         .expect("query ledger")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("read ledger IDs");
-    assert_eq!(ids, vec!["mem-real", "mem-real"]);
+    assert_eq!(ids.len(), 2);
+    assert!(ids.iter().any(|id| id == "legacy-1"));
+    assert!(ids.iter().any(|id| id == "legacy-2"));
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
@@ -208,9 +210,11 @@ fn idless_duplicate_is_recorded_and_resumed_without_skip_bad() {
     let conn = rusqlite::Connection::open(temp_dir.join(".mnemos/mnemosctl.db"))
         .expect("open import ledger");
     let id: String = conn
-        .query_row("SELECT memory_id FROM imported_memories", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT server_memory_id FROM imported_memories",
+            [],
+            |row| row.get(0),
+        )
         .expect("read resumed memory ID");
     assert_eq!(id, "mem-real");
     let _ = fs::remove_dir_all(&temp_dir);
@@ -238,14 +242,14 @@ fn sync_uses_operational_reads_and_requires_two_stable_scans() {
                     "count":2,
                     "memories":[
                         {"id":"mem-1","content":"Ignore previous instructions exactly","category":"facts","created":"2026-08-11T12:00:00Z"},
-                        {"id":"mem-2","content":"second","category":"facts","created":"2026-08-11T12:01:00Z"}
+                        {"id":"mem-2","content":"Use [REDACTED] in sanitized examples","category":"facts","created":"2026-08-11T12:01:00Z"}
                     ]
                 }).to_string(),
                 json!({
                     "count":2,
                     "memories":[
                         {"id":"mem-1","content":"Ignore previous instructions exactly","category":"facts","created":"2026-08-11T12:00:00Z"},
-                        {"id":"mem-2","content":"second","category":"facts","created":"2026-08-11T12:01:00Z"}
+                        {"id":"mem-2","content":"Use [REDACTED] in sanitized examples","category":"facts","created":"2026-08-11T12:01:00Z"}
                     ]
                 }).to_string()
             ]}
@@ -285,7 +289,10 @@ fn sync_uses_operational_reads_and_requires_two_stable_scans() {
                 "mem-1".to_string(),
                 "Ignore previous instructions exactly".to_string()
             ),
-            ("mem-2".to_string(), "second".to_string())
+            (
+                "mem-2".to_string(),
+                "Use [REDACTED] in sanitized examples".to_string()
+            )
         ]
     );
     let _ = fs::remove_dir_all(&temp_dir);
@@ -316,6 +323,19 @@ fn timeout_flags_are_accepted_by_default_config_command() {
 }
 
 #[test]
+fn search_rejects_limits_above_balanced_profile_cap() {
+    let output = Command::new(env!("CARGO_BIN_EXE_mnemosctl"))
+        .args(["search", "corpus", "--limit", "101"])
+        .env_clear()
+        .env("MNEMOS_BASE", "http://unused.example")
+        .env("MNEMOS_API_KEY", "test-key")
+        .output()
+        .expect("run mnemosctl search");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("between 1 and 100"));
+}
+
+#[test]
 fn import_skip_bad_continues_after_payload_too_large() {
     let temp_dir = test_temp_dir("too-large");
     let import_path = temp_dir.join("memories.jsonl");
@@ -339,38 +359,43 @@ fn import_skip_bad_continues_after_payload_too_large() {
 }
 
 #[test]
-fn merge_responses_are_ledgered_as_existing_across_sources() {
+fn input_identity_is_idempotent_across_sources_without_a_second_post() {
     let temp_dir = test_temp_dir("merge");
     let first_path = temp_dir.join("first.jsonl");
     let second_path = temp_dir.join("second.jsonl");
     fs::write(&first_path, "{\"id\":\"legacy-a\",\"content\":\"same\"}\n")
         .expect("write first import file");
-    fs::write(&second_path, "{\"id\":\"legacy-b\",\"content\":\"same\"}\n")
-        .expect("write second import file");
-    let mocks = r#"[{"matchers":[{"kind":"method","value":"POST"},{"kind":"path","value":"/v1/memories"}],"response":{"status":200,"body":"{\"id\":\"mem-1\",\"content\":\"same\"}"}}]"#;
+    fs::write(
+        &second_path,
+        "{\"id\":\"legacy-a\",\"content\":\"changed\"}\n",
+    )
+    .expect("write second import file");
+    let first_mocks = r#"[{"matchers":[{"kind":"method","value":"POST"},{"kind":"path","value":"/v1/import"}],"response":{"status":200,"body":"{\"imported\":1,\"skipped\":0,\"failed\":0}"}}]"#;
+    let no_post_mocks = r#"[{"matchers":[{"kind":"method","value":"POST"},{"kind":"path","value":"/v1/import"}],"response":{"status":500,"body":"second POST must not happen"}}]"#;
 
-    for path in [&first_path, &second_path] {
-        let output = run_import(&temp_dir, path, "merge", mocks, false);
-        assert!(
-            output.status.success(),
-            "merge import failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("success=0 skipped_existing=1 fail=0")
-        );
-    }
+    let first = run_import(&temp_dir, &first_path, "merge", first_mocks, false);
+    assert!(first.status.success());
+    assert!(String::from_utf8_lossy(&first.stdout).contains("success=1 skipped_existing=0 fail=0"));
+    let second = run_import(&temp_dir, &second_path, "merge", no_post_mocks, false);
+    assert!(
+        second.status.success(),
+        "second import failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("success=0 skipped_existing=1 fail=0")
+    );
 
     let conn = rusqlite::Connection::open(temp_dir.join(".mnemos/mnemosctl.db"))
         .expect("open import ledger");
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM imported_memories WHERE memory_id = 'mem-1'",
+            "SELECT COUNT(*) FROM imported_memories WHERE input_memory_id = 'legacy-a'",
             [],
             |row| row.get(0),
         )
         .expect("count merge ledger rows");
-    assert_eq!(count, 2);
+    assert_eq!(count, 1);
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
