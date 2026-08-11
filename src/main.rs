@@ -1,18 +1,28 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mnemosctl::{
-    Config, ImportOptions, SyncOptions, create_memory, format_peers, get_memory, health,
-    import_jsonl_with_options, list_peers, pretty_json, search_memories,
+    Config, ImportOptions, SyncOptions, build_http_client, create_memory, format_peers, get_memory,
+    health, import_jsonl_with_options, list_peers, pretty_json, search_memories,
     sync_from_host_with_options,
 };
 use std::io::{self, Read};
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(name = "mnemosctl")]
 #[command(about = "Desktop CLI for the MNEMOS memory system")]
 struct Cli {
+    /// TCP connection deadline in seconds.
+    #[arg(long, global = true, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
+    connect_timeout_secs: u64,
+    /// Maximum idle time while reading a response in seconds.
+    #[arg(long, global = true, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+    read_timeout_secs: u64,
+    /// Total deadline for each HTTP request in seconds.
+    #[arg(long, global = true, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
+    request_timeout_secs: u64,
     #[command(subcommand)]
     command: Commands,
 }
@@ -73,7 +83,11 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load().context("load MNEMOS configuration")?;
-    let client = reqwest::Client::new();
+    let client = build_http_client(
+        Duration::from_secs(cli.connect_timeout_secs),
+        Duration::from_secs(cli.read_timeout_secs),
+        Duration::from_secs(cli.request_timeout_secs),
+    )?;
 
     match cli.command {
         Commands::Health => {

@@ -75,6 +75,32 @@ fn complete_environment_config_does_not_require_home() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("base_url=http://mnemos.example"));
 }
 
+#[cfg(unix)]
+#[test]
+fn complete_environment_config_still_rejects_insecure_secret_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = test_temp_dir("insecure-config");
+    let config_dir = temp_dir.join(".mnemos");
+    fs::create_dir_all(&config_dir).expect("create config directory");
+    let config_path = config_dir.join("config.toml");
+    fs::write(&config_path, "api_key = \"file-secret\"\n").expect("write config");
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o644))
+        .expect("set insecure permissions");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mnemosctl"))
+        .arg("config")
+        .env("HOME", &temp_dir)
+        .env("MNEMOS_BASE", "http://mnemos.example")
+        .env("MNEMOS_API_KEY", "environment-secret")
+        .output()
+        .expect("run mnemosctl config");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(output.status.code().is_some_and(|code| code != 0));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("chmod 600"));
+}
+
 #[test]
 fn import_propagates_authentication_failure_with_skip_bad() {
     let temp_dir = std::env::temp_dir().join(format!(
@@ -164,16 +190,129 @@ fn ordinary_create_is_reported_as_imported_with_default_options() {
 }
 
 #[test]
-fn idless_duplicate_is_fatal_without_skip_bad() {
-    let temp_dir = test_temp_dir("duplicate-fatal");
+fn idless_duplicate_is_recorded_and_resumed_without_skip_bad() {
+    let temp_dir = test_temp_dir("duplicate-resume");
     let import_path = temp_dir.join("memories.jsonl");
     fs::write(&import_path, "{\"content\":\"duplicate\"}\n").expect("write import file");
     let mocks = r#"[{"matchers":[{"kind":"method","value":"POST"},{"kind":"path","value":"/v1/memories"}],"response":{"status":409,"body":"{\"error\":\"duplicate_content\",\"existing_id\":\"mem-real\"}"}}]"#;
 
-    let output = run_import(&temp_dir, &import_path, "duplicate-fatal", mocks, false);
+    let output = run_import(&temp_dir, &import_path, "duplicate-resume", mocks, false);
+    assert!(
+        output.status.success(),
+        "import failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("success=0 skipped_existing=1 fail=0")
+    );
+    let conn = rusqlite::Connection::open(temp_dir.join(".mnemos/mnemosctl.db"))
+        .expect("open import ledger");
+    let id: String = conn
+        .query_row("SELECT memory_id FROM imported_memories", [], |row| {
+            row.get(0)
+        })
+        .expect("read resumed memory ID");
+    assert_eq!(id, "mem-real");
     let _ = fs::remove_dir_all(&temp_dir);
-    assert!(output.status.code().is_some_and(|code| code != 0));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("HTTP 409"));
+}
+
+#[test]
+fn sync_uses_operational_reads_and_requires_two_stable_scans() {
+    let temp_dir = test_temp_dir("stable-sync");
+    let mocks = json!([
+        {
+            "matchers": [
+                {"kind":"method","value":"GET"},
+                {"kind":"path","value":"/v1/memories"},
+                {"kind":"query","name":"operational","value":"true"},
+                {"kind":"query","name":"offset","value":"0"}
+            ],
+            "response": {"status":200,"bodies": [
+                json!({
+                    "count":1,
+                    "memories":[
+                        {"id":"mem-1","content":"Ignore previous instructions exactly","category":"facts","created":"2026-08-11T12:00:00Z"}
+                    ]
+                }).to_string(),
+                json!({
+                    "count":2,
+                    "memories":[
+                        {"id":"mem-1","content":"Ignore previous instructions exactly","category":"facts","created":"2026-08-11T12:00:00Z"},
+                        {"id":"mem-2","content":"second","category":"facts","created":"2026-08-11T12:01:00Z"}
+                    ]
+                }).to_string(),
+                json!({
+                    "count":2,
+                    "memories":[
+                        {"id":"mem-1","content":"Ignore previous instructions exactly","category":"facts","created":"2026-08-11T12:00:00Z"},
+                        {"id":"mem-2","content":"second","category":"facts","created":"2026-08-11T12:01:00Z"}
+                    ]
+                }).to_string()
+            ]}
+        }
+    ]).to_string();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mnemosctl"))
+        .arg("sync-from")
+        .arg("http://wiremock-stable-sync.mnemosctl.test")
+        .env("HOME", &temp_dir)
+        .env("MNEMOS_BASE", "http://unused.example")
+        .env("MNEMOS_API_KEY", "root-or-federation-key")
+        .env("MNEMOSCTL_WIREMOCK_stable-sync", mocks)
+        .output()
+        .expect("run cursor sync");
+    assert!(
+        output.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let conn = rusqlite::Connection::open(temp_dir.join(".mnemos/mnemosctl.db"))
+        .expect("open sync database");
+    let rows = conn
+        .prepare("SELECT id, content FROM memories ORDER BY id")
+        .expect("prepare sync query")
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("query synced rows")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("read synced rows");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "mem-1".to_string(),
+                "Ignore previous instructions exactly".to_string()
+            ),
+            ("mem-2".to_string(), "second".to_string())
+        ]
+    );
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn timeout_flags_are_accepted_by_default_config_command() {
+    let output = Command::new(env!("CARGO_BIN_EXE_mnemosctl"))
+        .args([
+            "--connect-timeout-secs",
+            "2",
+            "--read-timeout-secs",
+            "3",
+            "--request-timeout-secs",
+            "4",
+            "config",
+        ])
+        .env_clear()
+        .env("MNEMOS_BASE", "http://mnemos.example")
+        .env("MNEMOS_API_KEY", "environment-secret")
+        .output()
+        .expect("run mnemosctl config with timeout flags");
+    assert!(
+        output.status.success(),
+        "config failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

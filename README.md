@@ -61,6 +61,11 @@ mnemosctl sync-from http://remote-mnemos:5002 --progress 500
 ```
 
 Pulls memories from a remote MNEMOS host in pages of 100 and upserts them into `~/.mnemos/mnemosctl.db`.
+The credential must have the MNEMOS `root` role because synchronization requests
+the unframed operational representation. The command completes only after two
+consecutive scans contain the same complete set of memory IDs. Vault memories
+are fetched individually; if the server redacts an incidental credential span,
+the command fails instead of storing the redacted text as canonical content.
 
 ```sh
 mnemosctl peers
@@ -80,6 +85,10 @@ mnemosctl config
 ```
 
 Prints the resolved `base_url` and a masked API key.
+
+All commands use finite HTTP deadlines. Override the defaults with global
+`--connect-timeout-secs`, `--read-timeout-secs`, and
+`--request-timeout-secs` options.
 
 ## Stress-tested behaviors
 

@@ -3,6 +3,7 @@ use reqwest::{Client, Request, RequestBuilder};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -11,9 +12,14 @@ use std::io::{BufRead, BufReader};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 use tracing::debug;
 
 const DEFAULT_PAGE_SIZE: usize = 100;
+const MAX_SYNC_SCAN_ATTEMPTS: usize = 5;
+static MOCK_RESPONSE_HITS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
@@ -75,14 +81,13 @@ impl Config {
         let env_base_url = env::var("MNEMOS_BASE").ok().and_then(non_empty);
         let env_api_key = env::var("MNEMOS_API_KEY").ok().and_then(non_empty);
 
-        if let (Some(base_url), Some(api_key)) = (&env_base_url, &env_api_key) {
-            return Ok(Self {
-                base_url: normalize_base_url(base_url),
-                api_key: api_key.clone(),
-            });
-        }
-
-        let file_config = load_file_config().context("read ~/.mnemos/config.toml")?;
+        let file_config = if env::var_os("HOME").is_some() {
+            load_file_config().context("read ~/.mnemos/config.toml")?
+        } else if env_base_url.is_some() && env_api_key.is_some() {
+            FileConfig::default()
+        } else {
+            load_file_config().context("read ~/.mnemos/config.toml")?
+        };
 
         let base_url = env_base_url
             .or(file_config.base_url.and_then(non_empty))
@@ -100,6 +105,19 @@ impl Config {
     pub fn masked_api_key(&self) -> String {
         mask_api_key(&self.api_key)
     }
+}
+
+pub fn build_http_client(
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    total_timeout: Duration,
+) -> Result<Client> {
+    Client::builder()
+        .connect_timeout(connect_timeout)
+        .read_timeout(read_timeout)
+        .timeout(total_timeout)
+        .build()
+        .context("build HTTP client")
 }
 
 pub async fn health(client: &Client, config: &Config) -> Result<Value> {
@@ -192,43 +210,54 @@ pub async fn sync_from_host_with_options(
 ) -> Result<SyncResult> {
     let conn = open_sync_db()?;
     let host = normalize_base_url(host);
-    let mut offset = 0usize;
     let mut result = SyncResult::default();
+    let mut previous_ids: Option<BTreeSet<String>> = None;
+    let mut stable_items = None;
 
-    loop {
-        let page = request_json(
-            client
-                .get(join_url(&host, "/v1/memories"))
-                .bearer_auth(api_key)
-                .query(&[("limit", DEFAULT_PAGE_SIZE), ("offset", offset)]),
-            "GET remote /v1/memories",
-        )
-        .await
-        .with_context(|| format!("pull memories from {host} at offset {offset}"))?;
-
-        if result.total.is_none() {
-            result.total = total_count(&page);
+    for _ in 0..MAX_SYNC_SCAN_ATTEMPTS {
+        let (items, total) = scan_remote_memories(client, api_key, &host).await?;
+        let ids = items.iter().filter_map(memory_id).collect::<BTreeSet<_>>();
+        if ids.len() != total {
+            previous_ids = None;
+            continue;
         }
-
-        let items = memory_items(&page);
-        if items.is_empty() {
+        if previous_ids.as_ref() == Some(&ids) {
+            result.total = Some(total);
+            stable_items = Some(items);
             break;
         }
+        previous_ids = Some(ids);
+    }
 
-        for item in &items {
-            if upsert_memory(&conn, item).context("upsert memory into local sqlite")? {
-                result.inserted += 1;
-            } else {
-                result.updated += 1;
-            }
-            result.processed += 1;
-            maybe_emit_progress(result.processed, result.total, options.progress_every);
+    let items = stable_items.context(
+        "remote memories changed during synchronization; no stable pagination boundary after 5 scans",
+    )?;
+    for mut item in items {
+        if item.get("vaulted").and_then(Value::as_bool) == Some(true) {
+            let id = memory_id(&item).context("vaulted memory is missing id")?;
+            item = request_json(
+                client
+                    .get(join_url(&host, &format!("/v1/memories/{id}")))
+                    .bearer_auth(api_key)
+                    .query(&[("operational", true)]),
+                "GET remote vaulted memory",
+            )
+            .await
+            .with_context(|| format!("pull vaulted memory {id} from {host}"))?;
+        } else if response_contains_redacted_content(&item) {
+            let id = memory_id(&item).unwrap_or_else(|| "<unknown>".to_string());
+            bail!(
+                "remote memory {id} contains redacted credential spans and cannot be stored as canonical content"
+            );
         }
 
-        if items.len() < DEFAULT_PAGE_SIZE {
-            break;
+        if upsert_memory(&conn, &item).context("upsert memory into local sqlite")? {
+            result.inserted += 1;
+        } else {
+            result.updated += 1;
         }
-        offset += items.len();
+        result.processed += 1;
+        maybe_emit_progress(result.processed, result.total, options.progress_every);
     }
 
     emit_final_progress(result.processed, result.total, options.progress_every);
@@ -237,6 +266,54 @@ pub async fn sync_from_host_with_options(
         result.inserted, result.processed
     );
     Ok(result)
+}
+
+async fn scan_remote_memories(
+    client: &Client,
+    api_key: &str,
+    host: &str,
+) -> Result<(Vec<Value>, usize)> {
+    let mut offset = 0usize;
+    let mut expected_total = None;
+    let mut items = Vec::new();
+
+    loop {
+        let page = request_json(
+            client
+                .get(join_url(host, "/v1/memories"))
+                .bearer_auth(api_key)
+                .query(&[
+                    ("limit", DEFAULT_PAGE_SIZE.to_string()),
+                    ("offset", offset.to_string()),
+                    ("operational", "true".to_string()),
+                ]),
+            "GET remote /v1/memories",
+        )
+        .await
+        .with_context(|| format!("pull memories from {host} at offset {offset}"))?;
+        let total = total_count(&page).context("remote memory list response is missing count")?;
+        if expected_total.is_some_and(|expected| expected != total) {
+            return Ok((Vec::new(), usize::MAX));
+        }
+        expected_total = Some(total);
+
+        let page_items = memory_items(&page);
+        let page_len = page_items.len();
+        items.extend(page_items.into_iter().cloned());
+        if page_len < DEFAULT_PAGE_SIZE {
+            break;
+        }
+        offset += page_len;
+    }
+
+    Ok((items, expected_total.unwrap_or(0)))
+}
+
+fn response_contains_redacted_content(memory: &Value) -> bool {
+    memory
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some_and(|content| content.contains("[REDACTED]"))
 }
 
 pub async fn import_jsonl(
@@ -302,7 +379,6 @@ pub async fn import_jsonl_with_options(
         }
 
         let input_id = memory_id(&value);
-        let has_input_id = input_id.is_some();
         if import_already_recorded(&conn, &source, &line_hash)? {
             result.skipped_existing += 1;
             maybe_emit_progress(result.processed, Some(result.total), options.progress_every);
@@ -332,10 +408,7 @@ pub async fn import_jsonl_with_options(
                     result.skipped_existing += 1;
                 }
             }
-            Err(error)
-                if (options.skip_bad || has_input_id)
-                    && error.duplicate_existing_id().is_some() =>
-            {
+            Err(error) if error.duplicate_existing_id().is_some() => {
                 let existing_id = error.duplicate_existing_id();
                 record_import(&conn, &source, &line_hash, existing_id.as_deref(), trimmed)?;
                 result.skipped_existing += 1;
@@ -511,17 +584,36 @@ fn maybe_wiremock_response(
         .as_array()
         .ok_or_else(|| JsonRequestError::other(anyhow!("{key} mock registry is not an array")))?;
 
-    for mock in mocks {
+    for (mock_index, mock) in mocks.iter().enumerate() {
         if wiremock_matches(mock, request) {
             let response = mock.get("response").unwrap_or(&Value::Null);
             let status = response
                 .get("status")
                 .and_then(Value::as_u64)
                 .unwrap_or(500) as u16;
-            let body = response.get("body").and_then(Value::as_str).unwrap_or("");
+            let body = if let Some(bodies) = response.get("bodies").and_then(Value::as_array) {
+                let response_key = format!("{key}:{mock_index}");
+                let mut hits = MOCK_RESPONSE_HITS.lock().map_err(|_| {
+                    JsonRequestError::other(anyhow!("mock response counter lock poisoned"))
+                })?;
+                let hit = hits.entry(response_key).or_default();
+                let index = (*hit).min(bodies.len().saturating_sub(1));
+                *hit += 1;
+                bodies
+                    .get(index)
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            } else {
+                response
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
 
             if !(200..300).contains(&status) {
-                return Err(JsonRequestError::http(context, status, body.to_string()));
+                return Err(JsonRequestError::http(context, status, body));
             }
 
             return if body.trim().is_empty() {
@@ -530,7 +622,7 @@ fn maybe_wiremock_response(
                     value: json!({}),
                 }))
             } else {
-                serde_json::from_str(body)
+                serde_json::from_str(&body)
                     .map(|value| Some(JsonResponse { status, value }))
                     .map_err(|error| {
                         JsonRequestError::other(anyhow!("{context} returned invalid JSON: {error}"))
@@ -577,6 +669,18 @@ fn wiremock_matches(mock: &Value, request: &Request) -> bool {
                     .get(name)
                     .and_then(|header| header.to_str().ok())
                     .is_some_and(|header| header == value)
+            }
+            "query" => {
+                let Some(name) = matcher.get("name").and_then(Value::as_str) else {
+                    return false;
+                };
+                let Some(value) = matcher.get("value").and_then(Value::as_str) else {
+                    return false;
+                };
+                request
+                    .url()
+                    .query_pairs()
+                    .any(|(key, candidate)| key == name && candidate == value)
             }
             _ => false,
         }
@@ -1063,6 +1167,18 @@ mod tests {
     }
 
     #[test]
+    fn sync_rejects_redacted_presentation_content() {
+        assert!(response_contains_redacted_content(&json!({
+            "id": "mem-secret",
+            "content": "token=[REDACTED]"
+        })));
+        assert!(!response_contains_redacted_content(&json!({
+            "id": "mem-clean",
+            "content": "ordinary canonical content"
+        })));
+    }
+
+    #[test]
     fn ledger_allows_multiple_source_rows_for_one_server_memory() -> Result<()> {
         let conn = Connection::open_in_memory()?;
         initialize_sync_schema(&conn)?;
@@ -1195,6 +1311,36 @@ mod tests {
         validate_secret_file_permissions(&path)?;
 
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn configured_total_timeout_bounds_a_stalled_response() -> Result<()> {
+        use tokio::net::TcpListener;
+
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.expect("accept client");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+        let client = build_http_client(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_millis(50),
+        )?;
+
+        let error = client
+            .get(format!("http://{address}/health"))
+            .send()
+            .await
+            .expect_err("stalled response should time out");
+        server.abort();
+        assert!(error.is_timeout());
         Ok(())
     }
 

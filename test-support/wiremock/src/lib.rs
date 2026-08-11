@@ -18,6 +18,10 @@ pub mod matchers {
     pub fn header(name: &str, value: &str) -> Matcher {
         Matcher::Header(name.to_ascii_lowercase(), value.to_string())
     }
+
+    pub fn query_param(name: &str, value: &str) -> Matcher {
+        Matcher::Query(name.to_string(), value.to_string())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -25,6 +29,7 @@ pub enum Matcher {
     Method(String),
     Path(String),
     Header(String, String),
+    Query(String, String),
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +144,11 @@ impl Matcher {
             }),
             Matcher::Header(name, value) => json!({
                 "kind": "header",
+                "name": name,
+                "value": value,
+            }),
+            Matcher::Query(name, value) => json!({
+                "kind": "query",
                 "name": name,
                 "value": value,
             }),
