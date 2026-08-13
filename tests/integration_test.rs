@@ -299,6 +299,48 @@ fn sync_uses_operational_reads_and_requires_two_stable_scans() {
 }
 
 #[test]
+fn sync_stops_at_reported_total_without_fetching_an_empty_page() {
+    let temp_dir = test_temp_dir("total-aware-sync");
+    let page = json!({
+        "count": 2,
+        "memories": [
+            {"id":"mem-1","content":"one","category":"facts","created":"2026-08-11T12:00:00Z"},
+            {"id":"mem-2","content":"two","category":"facts","created":"2026-08-11T12:01:00Z"}
+        ]
+    })
+    .to_string();
+    let mocks = json!([{
+        "matchers": [
+            {"kind":"method","value":"GET"},
+            {"kind":"path","value":"/v1/memories"},
+            {"kind":"query","name":"limit","value":"2"},
+            {"kind":"query","name":"offset","value":"0"}
+        ],
+        "response": {"status":200,"bodies":[page.clone(), page]}
+    }])
+    .to_string();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mnemosctl"))
+        .arg("sync-from")
+        .arg("http://wiremock-total-aware-sync.mnemosctl.test")
+        .args(["--page-size", "2"])
+        .env("HOME", &temp_dir)
+        .env("MNEMOS_BASE", "http://unused.example")
+        .env("MNEMOS_API_KEY", "root-or-federation-key")
+        .env("MNEMOSCTL_WIREMOCK_total-aware-sync", mocks)
+        .output()
+        .expect("run total-aware sync");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(
+        output.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("2 rows processed"));
+}
+
+#[test]
 fn timeout_flags_are_accepted_by_default_config_command() {
     let output = Command::new(env!("CARGO_BIN_EXE_mnemosctl"))
         .args([

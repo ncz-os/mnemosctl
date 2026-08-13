@@ -60,6 +60,7 @@ Fetches a single memory by ID.
 mnemosctl sync-from http://remote-mnemos:5002
 mnemosctl sync-from http://remote-mnemos:5002 --progress
 mnemosctl sync-from http://remote-mnemos:5002 --progress 500
+mnemosctl sync-from http://remote-mnemos:5002 --page-size 500
 ```
 
 Pulls memories from a remote MNEMOS host in pages of 100 and upserts them into `~/.mnemos/mnemosctl.db`.
@@ -102,6 +103,7 @@ All commands use finite HTTP deadlines. Override the defaults with global
 ## Stress-tested behaviors
 
 - `sync-from --progress [N]` emits `[progress] N/TOTAL rows processed` every N processed rows. The default interval is 100 when `--progress` is present.
+- `sync-from --page-size N` adjusts the remote fetch and local transaction size from 1 through 500. The default remains 100.
 - `import --progress [N]` uses the same progress format and default interval.
 - `import --skip-bad` skips malformed JSON rows, locally invalid rows, and rows that receive server-side 4xx responses, logs each skipped row, and continues.
 - `import` streams JSONL line by line and records successful imports in the local sqlite ledger by input memory ID or a path-independent line hash, so copied or moved input files remain idempotent.

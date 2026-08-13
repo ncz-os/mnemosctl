@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use mnemosctl::{
     Config, ImportOptions, SyncOptions, build_http_client, create_memory, format_peers, get_memory,
     health, import_jsonl_with_options, list_peers, pretty_json, search_memories,
-    sync_from_host_with_options,
+    sync_from_host_with_page_size,
 };
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -53,6 +53,12 @@ enum Commands {
     /// Pull memories from a remote MNEMOS host into local sqlite.
     SyncFrom {
         host: String,
+        /// Number of memories fetched and committed per page.
+        // .range() lives on RangedU64ValueParser, not on the generic
+        // value_parser!(usize), so the bound is expressed on u64 and narrowed
+        // at the use site. usize here would not compile.
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..=500))]
+        page_size: u64,
         #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "100")]
         progress: Option<usize>,
     },
@@ -123,14 +129,19 @@ async fn run() -> Result<()> {
             let response = get_memory(&client, &config, &id).await?;
             println!("{}", pretty_json(&response)?);
         }
-        Commands::SyncFrom { host, progress } => {
-            sync_from_host_with_options(
+        Commands::SyncFrom {
+            host,
+            page_size,
+            progress,
+        } => {
+            sync_from_host_with_page_size(
                 &client,
                 &config.api_key,
                 &host,
                 SyncOptions {
                     progress_every: progress,
                 },
+                page_size as usize,
             )
             .await?;
         }

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::{Client, Request, RequestBuilder};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Statement, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -17,6 +17,7 @@ use std::time::Duration;
 use tracing::debug;
 
 const DEFAULT_PAGE_SIZE: usize = 100;
+pub const MAX_SYNC_PAGE_SIZE: usize = 500;
 const BALANCED_SEARCH_LIMIT: usize = 100;
 const MAX_SYNC_SCAN_ATTEMPTS: usize = 5;
 static MOCK_RESPONSE_HITS: LazyLock<Mutex<HashMap<String, usize>>> =
@@ -214,14 +215,28 @@ pub async fn sync_from_host_with_options(
     host: &str,
     options: SyncOptions,
 ) -> Result<SyncResult> {
-    let conn = open_sync_db()?;
+    sync_from_host_with_page_size(client, api_key, host, options, DEFAULT_PAGE_SIZE).await
+}
+
+pub async fn sync_from_host_with_page_size(
+    client: &Client,
+    api_key: &str,
+    host: &str,
+    options: SyncOptions,
+    page_size: usize,
+) -> Result<SyncResult> {
+    if !(1..=MAX_SYNC_PAGE_SIZE).contains(&page_size) {
+        bail!("sync page size must be between 1 and {MAX_SYNC_PAGE_SIZE}");
+    }
+
+    let mut conn = open_sync_db()?;
     let host = normalize_base_url(host);
     let mut result = SyncResult::default();
     let mut previous_ids: Option<BTreeSet<String>> = None;
     let mut stable_items = None;
 
     for _ in 0..MAX_SYNC_SCAN_ATTEMPTS {
-        let (items, total) = scan_remote_memories(client, api_key, &host).await?;
+        let (items, total) = scan_remote_memories(client, api_key, &host, page_size).await?;
         let ids = items.iter().filter_map(memory_id).collect::<BTreeSet<_>>();
         if ids.len() != total {
             previous_ids = None;
@@ -238,32 +253,74 @@ pub async fn sync_from_host_with_options(
     let items = stable_items.context(
         "remote memories changed during synchronization; no stable pagination boundary after 5 scans",
     )?;
-    for mut item in items {
-        if item.get("vaulted").and_then(Value::as_bool) == Some(true) {
-            let id = memory_id(&item).context("vaulted memory is missing id")?;
-            item = request_json(
-                client
-                    .get(join_url(&host, &format!("/v1/memories/{id}")))
-                    .bearer_auth(api_key)
-                    .query(&[("operational", true)]),
-                "GET remote vaulted memory",
-            )
-            .await
-            .with_context(|| format!("pull vaulted memory {id} from {host}"))?;
-        } else if response_has_redaction_metadata(&item) {
-            let id = memory_id(&item).unwrap_or_else(|| "<unknown>".to_string());
-            bail!(
-                "remote memory {id} contains redacted credential spans and cannot be stored as canonical content"
-            );
+    for page in items.chunks(page_size) {
+        let mut page_items = Vec::with_capacity(page.len());
+        for item in page {
+            let mut item = item.clone();
+            if item.get("vaulted").and_then(Value::as_bool) == Some(true) {
+                let id = memory_id(&item).context("vaulted memory is missing id")?;
+                item = request_json(
+                    client
+                        .get(join_url(&host, &format!("/v1/memories/{id}")))
+                        .bearer_auth(api_key)
+                        .query(&[("operational", true)]),
+                    "GET remote vaulted memory",
+                )
+                .await
+                .with_context(|| format!("pull vaulted memory {id} from {host}"))?;
+            } else if response_has_redaction_metadata(&item) {
+                let id = memory_id(&item).unwrap_or_else(|| "<unknown>".to_string());
+                bail!(
+                    "remote memory {id} contains redacted credential spans and cannot be stored as canonical content"
+                );
+            }
+            page_items.push(item);
         }
 
-        if upsert_memory(&conn, &item).context("upsert memory into local sqlite")? {
-            result.inserted += 1;
-        } else {
-            result.updated += 1;
+        let transaction = conn
+            .transaction()
+            .context("begin sqlite sync page transaction")?;
+        let first_processed = result.processed + 1;
+        {
+            let mut insert = transaction
+                .prepare_cached(
+                    "
+                    INSERT INTO memories (id, content, category, created_at, raw_json)
+                    VALUES (?1, ?2, ?3, ?4, ?5)
+                    ON CONFLICT(id) DO NOTHING
+                    ",
+                )
+                .context("prepare sqlite memory insert")?;
+            let mut update = transaction
+                .prepare_cached(
+                    "
+                    UPDATE memories
+                    SET content = ?2,
+                        category = ?3,
+                        created_at = ?4,
+                        raw_json = ?5
+                    WHERE id = ?1 AND raw_json IS NOT ?5
+                    ",
+                )
+                .context("prepare sqlite memory update")?;
+
+            for item in &page_items {
+                if upsert_memory_with_statements(&mut insert, &mut update, item)
+                    .context("upsert memory into local sqlite")?
+                {
+                    result.inserted += 1;
+                } else {
+                    result.updated += 1;
+                }
+                result.processed += 1;
+            }
         }
-        result.processed += 1;
-        maybe_emit_progress(result.processed, result.total, options.progress_every);
+        transaction
+            .commit()
+            .context("commit sqlite sync page transaction")?;
+        for processed in first_processed..=result.processed {
+            maybe_emit_progress(processed, result.total, options.progress_every);
+        }
     }
 
     emit_final_progress(result.processed, result.total, options.progress_every);
@@ -278,6 +335,7 @@ async fn scan_remote_memories(
     client: &Client,
     api_key: &str,
     host: &str,
+    page_size: usize,
 ) -> Result<(Vec<Value>, usize)> {
     let mut offset = 0usize;
     let mut expected_total = None;
@@ -289,7 +347,7 @@ async fn scan_remote_memories(
                 .get(join_url(host, "/v1/memories"))
                 .bearer_auth(api_key)
                 .query(&[
-                    ("limit", DEFAULT_PAGE_SIZE.to_string()),
+                    ("limit", page_size.to_string()),
                     ("offset", offset.to_string()),
                     ("operational", "true".to_string()),
                 ]),
@@ -306,7 +364,7 @@ async fn scan_remote_memories(
         let page_items = memory_items(&page);
         let page_len = page_items.len();
         items.extend(page_items.into_iter().cloned());
-        if page_len < DEFAULT_PAGE_SIZE {
+        if items.len() >= total || page_len < page_size {
             break;
         }
         offset += page_len;
@@ -346,13 +404,17 @@ pub async fn import_jsonl_with_options(
     options: ImportOptions,
 ) -> Result<ImportResult> {
     let path = path.as_ref();
-    let total = count_jsonl_rows(path)?;
+    let known_total = options
+        .progress_every
+        .filter(|value| *value > 0)
+        .map(|_| count_jsonl_rows(path))
+        .transpose()?;
     let file = File::open(path).with_context(|| format!("open JSONL file {}", path.display()))?;
     let reader = BufReader::new(file);
     let conn = open_sync_db()?;
     let source = import_source(path);
     let mut result = ImportResult {
-        total,
+        total: known_total.unwrap_or(0),
         ..ImportResult::default()
     };
 
@@ -375,7 +437,7 @@ pub async fn import_jsonl_with_options(
                     index + 1,
                     format!("invalid JSON: {error}"),
                 );
-                maybe_emit_progress(result.processed, Some(result.total), options.progress_every);
+                maybe_emit_progress(result.processed, known_total, options.progress_every);
                 if options.skip_bad {
                     continue;
                 }
@@ -385,7 +447,7 @@ pub async fn import_jsonl_with_options(
 
         if let Err(error) = validate_import_row(&value) {
             handle_bad_import_row(&mut result, options, index + 1, error.to_string());
-            maybe_emit_progress(result.processed, Some(result.total), options.progress_every);
+            maybe_emit_progress(result.processed, known_total, options.progress_every);
             if options.skip_bad {
                 continue;
             }
@@ -395,7 +457,7 @@ pub async fn import_jsonl_with_options(
         let input_id = memory_id(&value);
         if import_already_recorded(&conn, input_id.as_deref(), &line_hash, trimmed)? {
             result.skipped_existing += 1;
-            maybe_emit_progress(result.processed, Some(result.total), options.progress_every);
+            maybe_emit_progress(result.processed, known_total, options.progress_every);
             continue;
         }
 
@@ -443,11 +505,7 @@ pub async fn import_jsonl_with_options(
                         response.value
                     );
                     handle_bad_import_row(&mut result, options, index + 1, error.to_string());
-                    maybe_emit_progress(
-                        result.processed,
-                        Some(result.total),
-                        options.progress_every,
-                    );
+                    maybe_emit_progress(result.processed, known_total, options.progress_every);
                     if options.skip_bad {
                         continue;
                     }
@@ -484,7 +542,7 @@ pub async fn import_jsonl_with_options(
             }
             Err(error) if error.is_bad_import_row() => {
                 handle_bad_import_row(&mut result, options, index + 1, error.to_string());
-                maybe_emit_progress(result.processed, Some(result.total), options.progress_every);
+                maybe_emit_progress(result.processed, known_total, options.progress_every);
                 if options.skip_bad {
                     continue;
                 }
@@ -495,10 +553,11 @@ pub async fn import_jsonl_with_options(
             }
         }
 
-        maybe_emit_progress(result.processed, Some(result.total), options.progress_every);
+        maybe_emit_progress(result.processed, known_total, options.progress_every);
     }
 
-    emit_final_progress(result.processed, Some(result.total), options.progress_every);
+    result.total = known_total.unwrap_or(result.processed);
+    emit_final_progress(result.processed, known_total, options.progress_every);
     Ok(result)
 }
 
@@ -907,6 +966,35 @@ fn sync_db_path() -> Result<PathBuf> {
 }
 
 fn upsert_memory(conn: &Connection, memory: &Value) -> Result<bool> {
+    let mut insert = conn
+        .prepare(
+            "
+            INSERT INTO memories (id, content, category, created_at, raw_json)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(id) DO NOTHING
+            ",
+        )
+        .context("prepare sqlite insert")?;
+    let mut update = conn
+        .prepare(
+            "
+            UPDATE memories
+            SET content = ?2,
+                category = ?3,
+                created_at = ?4,
+                raw_json = ?5
+            WHERE id = ?1 AND raw_json IS NOT ?5
+            ",
+        )
+        .context("prepare sqlite update")?;
+    upsert_memory_with_statements(&mut insert, &mut update, memory)
+}
+
+fn upsert_memory_with_statements(
+    insert: &mut Statement<'_>,
+    update: &mut Statement<'_>,
+    memory: &Value,
+) -> Result<bool> {
     let id = string_field(memory, &["id"]).context("memory is missing id")?;
     let content = string_field(memory, &["content"]).unwrap_or_default();
     let category = string_field(memory, &["category"]).unwrap_or_else(|| "facts".to_string());
@@ -915,31 +1003,15 @@ fn upsert_memory(conn: &Connection, memory: &Value) -> Result<bool> {
     let raw_json = serde_json::to_string(memory).context("serialize raw memory JSON")?;
 
     debug!(memory_id = %id, "upserting memory");
-    let inserted = conn
-        .execute(
-            "
-            INSERT INTO memories (id, content, category, created_at, raw_json)
-            VALUES (?1, ?2, ?3, ?4, ?5)
-            ON CONFLICT(id) DO NOTHING
-            ",
-            params![id, content, category, created_at, raw_json],
-        )
+    let inserted = insert
+        .execute(params![id, content, category, created_at, raw_json])
         .context("execute sqlite insert")?
         == 1;
 
     if !inserted {
-        conn.execute(
-            "
-            UPDATE memories
-            SET content = ?2,
-                category = ?3,
-                created_at = ?4,
-                raw_json = ?5
-            WHERE id = ?1
-            ",
-            params![id, content, category, created_at, raw_json],
-        )
-        .context("execute sqlite update")?;
+        update
+            .execute(params![id, content, category, created_at, raw_json])
+            .context("execute sqlite update")?;
     }
 
     Ok(inserted)
@@ -1613,6 +1685,39 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(created_at, "2026-08-10T12:00:00Z");
+        Ok(())
+    }
+
+    #[test]
+    fn sync_does_not_rewrite_unchanged_rows() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            "
+            CREATE TABLE memories (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                category TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                raw_json TEXT NOT NULL
+            );
+            ",
+        )?;
+        let memory = json!({
+            "id": "mem-1",
+            "content": "content",
+            "category": "facts",
+            "created": "2026-08-10T12:00:00Z"
+        });
+
+        assert!(upsert_memory(&conn, &memory)?);
+        let changes_after_insert = conn.total_changes();
+        assert!(!upsert_memory(&conn, &memory)?);
+        assert_eq!(conn.total_changes(), changes_after_insert);
+
+        let mut changed = memory;
+        changed["content"] = Value::String("changed".to_string());
+        assert!(!upsert_memory(&conn, &changed)?);
+        assert_eq!(conn.total_changes(), changes_after_insert + 1);
         Ok(())
     }
 
