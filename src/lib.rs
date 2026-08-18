@@ -965,6 +965,13 @@ fn sync_db_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".mnemos").join("mnemosctl.db"))
 }
 
+/// Prepare the insert/update statements and upsert a single memory.
+///
+/// Only the tests use this. The sync path prepares both statements once and
+/// drives [`upsert_memory_with_statements`] in a loop, so building them per
+/// call would be wasteful in production. Scoped to `cfg(test)` to keep it out
+/// of the library target, where it is dead code and fails `-D warnings`.
+#[cfg(test)]
 fn upsert_memory(conn: &Connection, memory: &Value) -> Result<bool> {
     let mut insert = conn
         .prepare(
