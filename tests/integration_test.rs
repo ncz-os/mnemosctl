@@ -261,6 +261,10 @@ fn sync_uses_operational_reads_and_requires_two_stable_scans() {
         .arg("http://wiremock-stable-sync.mnemosctl.test")
         .env("HOME", &temp_dir)
         .env("MNEMOS_BASE", "http://unused.example")
+        .env(
+            "MNEMOS_SYNC_HOSTS",
+            "http://wiremock-stable-sync.mnemosctl.test",
+        )
         .env("MNEMOS_API_KEY", "root-or-federation-key")
         .env("MNEMOSCTL_WIREMOCK_stable-sync", mocks)
         .output()
@@ -326,6 +330,10 @@ fn sync_stops_at_reported_total_without_fetching_an_empty_page() {
         .args(["--page-size", "2"])
         .env("HOME", &temp_dir)
         .env("MNEMOS_BASE", "http://unused.example")
+        .env(
+            "MNEMOS_SYNC_HOSTS",
+            "http://wiremock-total-aware-sync.mnemosctl.test",
+        )
         .env("MNEMOS_API_KEY", "root-or-federation-key")
         .env("MNEMOSCTL_WIREMOCK_total-aware-sync", mocks)
         .output()
@@ -476,4 +484,120 @@ fn run_import(
         command.arg("--skip-bad");
     }
     command.output().expect("run mnemosctl import")
+}
+
+#[test]
+fn sync_from_rejects_unlisted_host_without_requests_or_bypass_flag() {
+    let temp_dir = test_temp_dir("sync-security-boundary");
+    let request_log = temp_dir.join("requests.log");
+    fs::write(&request_log, "").expect("initialize mock request log");
+    let mock_key = "MNEMOSCTL_WIREMOCK_rejected-sync";
+    let mocks = json!([{
+        "matchers": [
+            {"kind":"method","value":"GET"},
+            {"kind":"header","name":"authorization","value":"Bearer root-sentinel"}
+        ],
+        "response": {"status":200,"body":"{\"count\":0,\"memories\":[]}"}
+    }])
+    .to_string();
+
+    let run = |extra_arg: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mnemosctl"));
+        command
+            .arg("sync-from")
+            .arg("https://wiremock-rejected-sync.mnemosctl.test")
+            .env("HOME", &temp_dir)
+            .env("MNEMOS_BASE", "http://unused.example")
+            .env("MNEMOS_API_KEY", "root-sentinel")
+            .env_remove("MNEMOS_SYNC_HOSTS")
+            .env(mock_key, &mocks)
+            .env(format!("{mock_key}_REQUEST_LOG"), &request_log);
+        if let Some(arg) = extra_arg {
+            command.arg(arg);
+        }
+        command.output().expect("run rejected sync")
+    };
+
+    let rejected = run(None);
+    assert!(!rejected.status.success(), "unlisted host must be rejected");
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr)
+            .contains("refusing to send the local MNEMOS root token"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&request_log)
+            .expect("read mock request log")
+            .lines()
+            .count(),
+        0,
+        "a rejected destination must receive zero HTTP requests"
+    );
+
+    let removed_flag = run(Some("--allow-unlisted-host"));
+    assert!(
+        !removed_flag.status.success(),
+        "removed flag must not parse"
+    );
+    let stderr = String::from_utf8_lossy(&removed_flag.stderr);
+    assert!(stderr.contains("unexpected argument"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(&request_log)
+            .expect("read mock request log after parse rejection")
+            .lines()
+            .count(),
+        0,
+        "the removed bypass flag must not trigger an HTTP request"
+    );
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn sync_from_allowed_mock_records_token_bearing_requests() {
+    let temp_dir = test_temp_dir("sync-request-recorder-control");
+    let request_log = temp_dir.join("requests.log");
+    fs::write(&request_log, "").expect("initialize mock request log");
+    let mock_key = "MNEMOSCTL_WIREMOCK_allowed-sync";
+    let mocks = json!([{
+        "matchers": [
+            {"kind":"method","value":"GET"},
+            {"kind":"path","value":"/v1/memories"},
+            {"kind":"header","name":"authorization","value":"Bearer root-sentinel"}
+        ],
+        "response": {"status":200,"body":"{\"count\":0,\"memories\":[]}"}
+    }])
+    .to_string();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mnemosctl"))
+        .arg("sync-from")
+        .arg("https://wiremock-allowed-sync.mnemosctl.test")
+        .env("HOME", &temp_dir)
+        .env("MNEMOS_BASE", "http://unused.example")
+        .env(
+            "MNEMOS_SYNC_HOSTS",
+            "https://wiremock-allowed-sync.mnemosctl.test",
+        )
+        .env("MNEMOS_API_KEY", "root-sentinel")
+        .env(mock_key, mocks)
+        .env(format!("{mock_key}_REQUEST_LOG"), &request_log)
+        .output()
+        .expect("run allowed sync");
+    assert!(
+        output.status.success(),
+        "allowed sync failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let requests = fs::read_to_string(&request_log).expect("read mock request log");
+    assert_eq!(
+        requests.lines().count(),
+        2,
+        "stable sync requires two scans"
+    );
+    // The mounted mock matches the sentinel Authorization header, so process
+    // success plus the count proves the recorder observes real requests and
+    // the expected credential without writing the secret to the log.
+
+    let _ = fs::remove_dir_all(&temp_dir);
 }

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow, bail};
-use reqwest::{Client, Request, RequestBuilder};
+use reqwest::{Client, Request, RequestBuilder, Url, redirect};
 use rusqlite::{Connection, OptionalExtension, Statement, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -7,8 +7,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::net::{IpAddr, SocketAddr};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -20,6 +21,7 @@ const DEFAULT_PAGE_SIZE: usize = 100;
 pub const MAX_SYNC_PAGE_SIZE: usize = 500;
 const BALANCED_SEARCH_LIMIT: usize = 100;
 const MAX_SYNC_SCAN_ATTEMPTS: usize = 5;
+const SYNC_HOSTS_ENV: &str = "MNEMOS_SYNC_HOSTS";
 static MOCK_RESPONSE_HITS: LazyLock<Mutex<HashMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -33,6 +35,7 @@ pub struct Config {
 struct FileConfig {
     base_url: Option<String>,
     api_key: Option<String>,
+    sync_hosts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -50,9 +53,23 @@ struct CreateRequest<'a> {
     category: &'a str,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct SyncOptions {
     pub progress_every: Option<usize>,
+    pub connect_timeout: Duration,
+    pub read_timeout: Duration,
+    pub request_timeout: Duration,
+}
+
+impl Default for SyncOptions {
+    fn default() -> Self {
+        Self {
+            progress_every: None,
+            connect_timeout: Duration::from_secs(10),
+            read_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(120),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -98,10 +115,11 @@ impl Config {
             .or(file_config.api_key.and_then(non_empty))
             .context("MNEMOS_API_KEY is not set and ~/.mnemos/config.toml has no api_key")?;
 
-        Ok(Self {
-            base_url: normalize_base_url(&base_url),
-            api_key,
-        })
+        let base_url = parse_endpoint_url(&base_url)
+            .context("MNEMOS base URL is not usable")?
+            .to_string();
+
+        Ok(Self { base_url, api_key })
     }
 
     pub fn masked_api_key(&self) -> String {
@@ -204,23 +222,21 @@ pub async fn list_peers(client: &Client, config: &Config) -> Result<Value> {
     .await
 }
 
-pub async fn sync_from_host(client: &Client, api_key: &str, host: &str) -> Result<usize> {
-    let result = sync_from_host_with_options(client, api_key, host, SyncOptions::default()).await?;
+pub async fn sync_from_host(config: &Config, host: &str) -> Result<usize> {
+    let result = sync_from_host_with_options(config, host, SyncOptions::default()).await?;
     Ok(result.inserted)
 }
 
 pub async fn sync_from_host_with_options(
-    client: &Client,
-    api_key: &str,
+    config: &Config,
     host: &str,
     options: SyncOptions,
 ) -> Result<SyncResult> {
-    sync_from_host_with_page_size(client, api_key, host, options, DEFAULT_PAGE_SIZE).await
+    sync_from_host_with_page_size(config, host, options, DEFAULT_PAGE_SIZE).await
 }
 
 pub async fn sync_from_host_with_page_size(
-    client: &Client,
-    api_key: &str,
+    config: &Config,
     host: &str,
     options: SyncOptions,
     page_size: usize,
@@ -229,14 +245,20 @@ pub async fn sync_from_host_with_page_size(
         bail!("sync page size must be between 1 and {MAX_SYNC_PAGE_SIZE}");
     }
 
+    // Authorization must complete before DNS resolution, database access, or
+    // request construction. The dedicated client pins the authorized
+    // hostname to this resolution for every connection it opens.
+    let endpoint = authorize_sync_host(host, &config.base_url, &sync_host_allowlist()?)?;
+    let client = build_pinned_sync_client(&endpoint, options).await?;
+    let host = endpoint.to_string();
+    let api_key = config.api_key.as_str();
     let mut conn = open_sync_db()?;
-    let host = normalize_base_url(host);
     let mut result = SyncResult::default();
     let mut previous_ids: Option<BTreeSet<String>> = None;
     let mut stable_items = None;
 
     for _ in 0..MAX_SYNC_SCAN_ATTEMPTS {
-        let (items, total) = scan_remote_memories(client, api_key, &host, page_size).await?;
+        let (items, total) = scan_remote_memories(&client, api_key, &host, page_size).await?;
         let ids = items.iter().filter_map(memory_id).collect::<BTreeSet<_>>();
         if ids.len() != total {
             previous_ids = None;
@@ -694,14 +716,11 @@ fn maybe_wiremock_response(
     let Some(host) = request.url().host_str() else {
         return Ok(None);
     };
-    let Some(id) = host
-        .strip_prefix("wiremock-")
-        .and_then(|value| value.strip_suffix(".mnemosctl.test"))
-    else {
+    let Some(key) = mock_registry_key(host) else {
         return Ok(None);
     };
 
-    let key = format!("MNEMOSCTL_WIREMOCK_{id}");
+    record_wiremock_request(&key, request).map_err(JsonRequestError::other)?;
     let mocks = env::var(&key).map_err(|error| {
         JsonRequestError::other(anyhow!("{context} has no mounted mock: {error}"))
     })?;
@@ -763,6 +782,23 @@ fn maybe_wiremock_response(
         request.method(),
         request.url().path()
     )))
+}
+
+fn record_wiremock_request(key: &str, request: &Request) -> Result<()> {
+    let Some(path) = env::var_os(format!("{key}_REQUEST_LOG")) else {
+        return Ok(());
+    };
+    writeln!(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("open mock request log {}", PathBuf::from(&path).display()))?,
+        "{} {}",
+        request.method(),
+        request.url()
+    )
+    .context("record mock HTTP request")
 }
 
 fn wiremock_matches(mock: &Value, request: &Request) -> bool {
@@ -1392,8 +1428,185 @@ fn non_empty(value: String) -> Option<String> {
     }
 }
 
-fn normalize_base_url(value: &str) -> String {
-    value.trim().trim_end_matches('/').to_string()
+/// A validated MNEMOS endpoint. Equality is structural so harmless spelling
+/// differences such as host casing or an explicit default port cannot evade
+/// or accidentally miss the allowlist.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EndpointUrl {
+    scheme: String,
+    host: String,
+    port: u16,
+    path: String,
+}
+
+impl fmt::Display for EndpointUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        let default_port = match self.scheme.as_str() {
+            "http" => 80,
+            "https" => 443,
+            _ => unreachable!("endpoint schemes are validated"),
+        };
+        if self.port == default_port {
+            write!(formatter, "{}://{}{}", self.scheme, host, self.path)
+        } else {
+            write!(
+                formatter,
+                "{}://{}:{}{}",
+                self.scheme, host, self.port, self.path
+            )
+        }
+    }
+}
+
+fn parse_endpoint_url(value: &str) -> Result<EndpointUrl> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("host URL is empty");
+    }
+    if trimmed
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        bail!("host URL {trimmed:?} contains whitespace or control characters");
+    }
+
+    let url = Url::parse(trimmed).with_context(|| {
+        format!("host URL {trimmed:?} is invalid; include an explicit http:// or https:// scheme")
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!(
+            "host URL {trimmed:?} uses unsupported scheme {:?}; expected http or https",
+            url.scheme()
+        );
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("host URL {trimmed:?} embeds userinfo credentials and will not be used");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        bail!("host URL {trimmed:?} must not carry a query string or fragment");
+    }
+    let host = url
+        .host_str()
+        .context("host URL has no hostname")?
+        .to_ascii_lowercase();
+    let port = url
+        .port_or_known_default()
+        .context("host URL has no usable port")?;
+    let path = url.path().trim_end_matches('/').to_string();
+
+    Ok(EndpointUrl {
+        scheme: url.scheme().to_string(),
+        host,
+        port,
+        path,
+    })
+}
+
+/// clap value parser for `sync-from`, kept syntax-only so command parsing never
+/// performs DNS or reads configuration.
+pub fn parse_sync_host_arg(value: &str) -> std::result::Result<String, String> {
+    parse_endpoint_url(value)
+        .map(|endpoint| endpoint.to_string())
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn sync_host_allowlist() -> Result<Vec<String>> {
+    if let Some(raw) = env::var(SYNC_HOSTS_ENV).ok().and_then(non_empty) {
+        return Ok(raw
+            .split([',', ' ', '\t', '\n'])
+            .filter_map(|entry| non_empty(entry.to_string()))
+            .collect());
+    }
+    if env::var_os("HOME").is_none() {
+        return Ok(Vec::new());
+    }
+    Ok(load_file_config()
+        .context("read ~/.mnemos/config.toml")?
+        .sync_hosts
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(non_empty)
+        .collect())
+}
+
+fn authorize_sync_host(host: &str, base_url: &str, allowlist: &[String]) -> Result<EndpointUrl> {
+    let target = parse_endpoint_url(host).context("reject sync-from host")?;
+    let configured = parse_endpoint_url(base_url).context("validate configured MNEMOS host")?;
+    if target == configured {
+        return Ok(target);
+    }
+
+    for entry in allowlist {
+        let allowed = parse_endpoint_url(entry)
+            .with_context(|| format!("invalid {SYNC_HOSTS_ENV} entry {entry:?}"))?;
+        if target == allowed {
+            return Ok(target);
+        }
+    }
+
+    bail!(
+        "refusing to send the local MNEMOS root token to {target}: it is neither the configured \
+         MNEMOS host ({base_url}) nor in the sync allowlist. Add it to {SYNC_HOSTS_ENV} or to \
+         sync_hosts in ~/.mnemos/config.toml"
+    )
+}
+
+async fn build_pinned_sync_client(endpoint: &EndpointUrl, options: SyncOptions) -> Result<Client> {
+    let addrs = resolve_sync_endpoint(endpoint).await?;
+    Client::builder()
+        .connect_timeout(options.connect_timeout)
+        .read_timeout(options.read_timeout)
+        .timeout(options.request_timeout)
+        // A proxy would connect somewhere other than the addresses authorized
+        // below. Redirects would likewise change the credential destination.
+        .no_proxy()
+        .redirect(redirect::Policy::none())
+        // reqwest consults this static override whenever it opens a connection,
+        // so it cannot perform a second DNS lookup and rebind the hostname.
+        .resolve_to_addrs(&endpoint.host, &addrs)
+        .build()
+        .context("build DNS-pinned sync HTTP client")
+}
+
+async fn resolve_sync_endpoint(endpoint: &EndpointUrl) -> Result<Vec<SocketAddr>> {
+    if let Ok(ip) = endpoint.host.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, endpoint.port)]);
+    }
+
+    // The repository's subprocess-safe mock layer recognizes these reserved
+    // test hostnames before network I/O. Give the client a deterministic pin
+    // so tests exercise the same pinned-client construction path without DNS.
+    if mock_registry_key(&endpoint.host).is_some_and(|key| env::var_os(key).is_some()) {
+        return Ok(vec![SocketAddr::new(
+            IpAddr::from([127, 0, 0, 1]),
+            endpoint.port,
+        )]);
+    }
+
+    let mut addrs = tokio::net::lookup_host((endpoint.host.as_str(), endpoint.port))
+        .await
+        .with_context(|| format!("resolve authorized sync host {}", endpoint.host))?
+        .collect::<Vec<_>>();
+    addrs.sort_unstable();
+    addrs.dedup();
+    if addrs.is_empty() {
+        bail!(
+            "authorized sync host {} resolved to no addresses",
+            endpoint.host
+        );
+    }
+    Ok(addrs)
+}
+
+fn mock_registry_key(host: &str) -> Option<String> {
+    host.strip_prefix("wiremock-")
+        .and_then(|value| value.strip_suffix(".mnemosctl.test"))
+        .map(|id| format!("MNEMOSCTL_WIREMOCK_{id}"))
 }
 
 fn join_url(base: &str, path: &str) -> String {

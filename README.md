@@ -22,9 +22,15 @@ You can also use `~/.mnemos/config.toml`:
 ```toml
 base_url = "http://192.168.207.67:5002"
 api_key = "your-api-key"
+sync_hosts = ["http://192.168.207.10:5002"]
 ```
 
 Environment variables take precedence over the config file.
+
+`sync_hosts` (or `MNEMOS_SYNC_HOSTS`, a comma-separated list) is the persistent
+allowlist of remote endpoints that `sync-from` may receive the local root Bearer
+token. The configured `base_url` is always allowed. To authorize another host,
+add it to this configuration; there is no command-line bypass.
 
 ## Commands
 
@@ -64,6 +70,10 @@ mnemosctl sync-from http://remote-mnemos:5002 --page-size 500
 ```
 
 Pulls memories from a remote MNEMOS host in pages of 100 and upserts them into `~/.mnemos/mnemosctl.db`.
+The destination is allowlist-checked before any request is built. Hostnames are
+resolved once after authorization and pinned in the dedicated HTTP client for
+all connection attempts, preventing a later DNS answer from redirecting the
+root token. Proxy routing and redirects are disabled for these requests.
 The credential must have the MNEMOS `root` role because synchronization requests
 the unframed operational representation. The command completes only after two
 consecutive scans contain the same complete set of memory IDs. Vault memories

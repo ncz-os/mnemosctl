@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mnemosctl::{
     Config, ImportOptions, SyncOptions, build_http_client, create_memory, format_peers, get_memory,
-    health, import_jsonl_with_options, list_peers, pretty_json, search_memories,
-    sync_from_host_with_page_size,
+    health, import_jsonl_with_options, list_peers, parse_sync_host_arg, pretty_json,
+    search_memories, sync_from_host_with_page_size,
 };
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -52,6 +52,9 @@ enum Commands {
     Get { id: String },
     /// Pull memories from a remote MNEMOS host into local sqlite.
     SyncFrom {
+        /// Remote MNEMOS base URL. The local root token is sent only after
+        /// this destination is checked against the persistent allowlist.
+        #[arg(value_parser = parse_sync_host_arg)]
         host: String,
         /// Number of memories fetched and committed per page.
         // .range() lives on RangedU64ValueParser, not on the generic
@@ -135,11 +138,13 @@ async fn run() -> Result<()> {
             progress,
         } => {
             sync_from_host_with_page_size(
-                &client,
-                &config.api_key,
+                &config,
                 &host,
                 SyncOptions {
                     progress_every: progress,
+                    connect_timeout: Duration::from_secs(cli.connect_timeout_secs),
+                    read_timeout: Duration::from_secs(cli.read_timeout_secs),
+                    request_timeout: Duration::from_secs(cli.request_timeout_secs),
                 },
                 page_size as usize,
             )
