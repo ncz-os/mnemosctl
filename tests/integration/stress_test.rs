@@ -19,10 +19,8 @@ async fn sync_from_host_is_fast_and_idempotent_at_corpus_scale() -> Result<()> {
         skip_stress();
         return Ok(());
     };
-    let client = reqwest::Client::new();
-
     let started = Instant::now();
-    sync_from_host(&client, &config.api_key, SYNC_STRESS_HOST).await?;
+    sync_from_host(&config, SYNC_STRESS_HOST).await?;
     assert!(
         started.elapsed() < Duration::from_secs(30),
         "sync-from should complete in under 30s"
@@ -34,7 +32,7 @@ async fn sync_from_host_is_fast_and_idempotent_at_corpus_scale() -> Result<()> {
         "expected at least 5000 local sqlite rows, got {local_count}"
     );
 
-    let inserted_on_rerun = sync_from_host(&client, &config.api_key, SYNC_STRESS_HOST).await?;
+    let inserted_on_rerun = sync_from_host(&config, SYNC_STRESS_HOST).await?;
     assert_eq!(
         inserted_on_rerun, 0,
         "sync-from rerun should insert zero new rows"
