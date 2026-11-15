@@ -32,6 +32,24 @@ allowlist of remote endpoints that `sync-from` may receive the local root Bearer
 token. The configured `base_url` is always allowed. To authorize another host,
 add it to this configuration; there is no command-line bypass.
 
+## Transport security
+
+Fleet endpoints must use `https`. Plaintext `http` to a non-loopback host is
+refused before any request is built, so the bearer never leaves the process.
+Loopback destinations (`localhost`, `127.0.0.0/8`, `::1`) stay allowed over
+`http` because the traffic never leaves the machine.
+
+For the trusted LAN, an explicit opt-in keeps plaintext available:
+
+```sh
+export MNEMOS_ALLOW_INSECURE_TRANSPORT=1
+export MNEMOS_BASE=http://192.168.207.67:5002
+```
+
+The opt-in logs a one-time process warning naming the destination. Fleet
+profiles that still target `http` LAN hosts must set this variable explicitly
+and document why the segment is trusted.
+
 ## Commands
 
 ```sh

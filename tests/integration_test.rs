@@ -58,11 +58,127 @@ async fn test_search_returns_results() {
 }
 
 #[test]
+fn http_base_to_lan_host_is_refused_without_opt_in() {
+    let temp_dir = test_temp_dir("lan-http-refused");
+    let output = Command::new(env!("CARGO_BIN_EXE_mnemosctl"))
+        .arg("config")
+        .env_clear()
+        .env("HOME", &temp_dir)
+        .env("MNEMOS_BASE", "http://10.20.30.40:5002")
+        .env("MNEMOS_API_KEY", "environment-secret")
+        .output()
+        .expect("run mnemosctl config");
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(
+        !output.status.success(),
+        "plaintext http to a LAN host must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MNEMOS_ALLOW_INSECURE_TRANSPORT"),
+        "refusal must name the opt-in: {stderr}"
+    );
+}
+
+#[test]
+fn http_base_to_lan_host_works_with_explicit_opt_in_and_warns_once() {
+    let temp_dir = test_temp_dir("lan-http-opt-in");
+    let output = Command::new(env!("CARGO_BIN_EXE_mnemosctl"))
+        .arg("config")
+        .env_clear()
+        .env("HOME", &temp_dir)
+        .env("MNEMOS_BASE", "http://10.20.30.40:5002")
+        .env("MNEMOS_API_KEY", "environment-secret")
+        .env("MNEMOS_ALLOW_INSECURE_TRANSPORT", "1")
+        .output()
+        .expect("run mnemosctl config");
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(
+        output.status.success(),
+        "opt-in should allow plaintext LAN transport: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("base_url=http://10.20.30.40:5002"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("MNEMOS_ALLOW_INSECURE_TRANSPORT").count(),
+        1,
+        "the insecure-transport warning must be logged exactly once: {stderr}"
+    );
+}
+
+#[test]
+fn https_and_loopback_bases_need_no_opt_in() {
+    for base in [
+        "https://10.20.30.40:5002",
+        "http://127.0.0.1:5002",
+        "http://localhost:5002",
+    ] {
+        let temp_dir = test_temp_dir("secure-default");
+        let output = Command::new(env!("CARGO_BIN_EXE_mnemosctl"))
+            .arg("config")
+            .env_clear()
+            .env("HOME", &temp_dir)
+            .env("MNEMOS_BASE", base)
+            .env("MNEMOS_API_KEY", "environment-secret")
+            .output()
+            .expect("run mnemosctl config");
+        let _ = fs::remove_dir_all(&temp_dir);
+        assert!(
+            output.status.success(),
+            "{base} must stay allowed without the opt-in: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("MNEMOS_ALLOW_INSECURE_TRANSPORT"),
+            "{base} must not warn: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn sync_from_refuses_plaintext_lan_host_before_any_request() {
+    let temp_dir = test_temp_dir("lan-sync-refused");
+    let output = Command::new(env!("CARGO_BIN_EXE_mnemosctl"))
+        .args([
+            "--connect-timeout-secs",
+            "1",
+            "--read-timeout-secs",
+            "1",
+            "--request-timeout-secs",
+            "2",
+            "sync-from",
+            "http://10.20.30.40:5002",
+        ])
+        .env("HOME", &temp_dir)
+        .env("MNEMOS_BASE", "https://mnemos.example")
+        .env("MNEMOS_SYNC_HOSTS", "http://10.20.30.40:5002")
+        .env("MNEMOS_API_KEY", "root-sentinel")
+        .output()
+        .expect("run rejected LAN sync");
+    let _ = fs::remove_dir_all(&temp_dir);
+    assert!(
+        !output.status.success(),
+        "plaintext LAN sync destination must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MNEMOS_ALLOW_INSECURE_TRANSPORT"),
+        "refusal must name the opt-in: {stderr}"
+    );
+    assert!(
+        !stderr.contains("refusing to send the local MNEMOS root token"),
+        "transport must be refused before the allowlist check runs: {stderr}"
+    );
+}
+
+#[test]
 fn complete_environment_config_does_not_require_home() {
     let output = Command::new(env!("CARGO_BIN_EXE_mnemosctl"))
         .arg("config")
         .env_clear()
-        .env("MNEMOS_BASE", "http://mnemos.example/")
+        .env("MNEMOS_BASE", "http://127.0.0.1:5002")
         .env("MNEMOS_API_KEY", "environment-secret")
         .output()
         .expect("run mnemosctl config");
@@ -72,7 +188,7 @@ fn complete_environment_config_does_not_require_home() {
         "config failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(String::from_utf8_lossy(&output.stdout).contains("base_url=http://mnemos.example"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("base_url=http://127.0.0.1:5002"));
 }
 
 #[cfg(unix)]
@@ -91,7 +207,7 @@ fn complete_environment_config_still_rejects_insecure_secret_file() {
     let output = Command::new(env!("CARGO_BIN_EXE_mnemosctl"))
         .arg("config")
         .env("HOME", &temp_dir)
-        .env("MNEMOS_BASE", "http://mnemos.example")
+        .env("MNEMOS_BASE", "http://127.0.0.1:5002")
         .env("MNEMOS_API_KEY", "environment-secret")
         .output()
         .expect("run mnemosctl config");
@@ -127,6 +243,7 @@ fn import_propagates_authentication_failure_with_skip_bad() {
         .env("HOME", &temp_dir)
         .env("MNEMOS_BASE", "http://wiremock-auth.mnemosctl.test")
         .env("MNEMOS_API_KEY", "expired")
+        .env("MNEMOS_ALLOW_INSECURE_TRANSPORT", "1")
         .env("MNEMOSCTL_WIREMOCK_auth", mocks)
         .output()
         .expect("run mnemosctl import");
@@ -266,6 +383,7 @@ fn sync_uses_operational_reads_and_requires_two_stable_scans() {
             "http://wiremock-stable-sync.mnemosctl.test",
         )
         .env("MNEMOS_API_KEY", "root-or-federation-key")
+        .env("MNEMOS_ALLOW_INSECURE_TRANSPORT", "1")
         .env("MNEMOSCTL_WIREMOCK_stable-sync", mocks)
         .output()
         .expect("run cursor sync");
@@ -335,6 +453,7 @@ fn sync_stops_at_reported_total_without_fetching_an_empty_page() {
             "http://wiremock-total-aware-sync.mnemosctl.test",
         )
         .env("MNEMOS_API_KEY", "root-or-federation-key")
+        .env("MNEMOS_ALLOW_INSECURE_TRANSPORT", "1")
         .env("MNEMOSCTL_WIREMOCK_total-aware-sync", mocks)
         .output()
         .expect("run total-aware sync");
@@ -363,6 +482,7 @@ fn timeout_flags_are_accepted_by_default_config_command() {
         .env_clear()
         .env("MNEMOS_BASE", "http://mnemos.example")
         .env("MNEMOS_API_KEY", "environment-secret")
+        .env("MNEMOS_ALLOW_INSECURE_TRANSPORT", "1")
         .output()
         .expect("run mnemosctl config with timeout flags");
     assert!(
@@ -379,6 +499,7 @@ fn search_rejects_limits_above_balanced_profile_cap() {
         .env_clear()
         .env("MNEMOS_BASE", "http://unused.example")
         .env("MNEMOS_API_KEY", "test-key")
+        .env("MNEMOS_ALLOW_INSECURE_TRANSPORT", "1")
         .output()
         .expect("run mnemosctl search");
     assert!(!output.status.success());
@@ -479,6 +600,7 @@ fn run_import(
             format!("http://wiremock-{mock_id}.mnemosctl.test"),
         )
         .env("MNEMOS_API_KEY", "test-key")
+        .env("MNEMOS_ALLOW_INSECURE_TRANSPORT", "1")
         .env(format!("MNEMOSCTL_WIREMOCK_{mock_id}"), mocks);
     if skip_bad {
         command.arg("--skip-bad");
@@ -507,7 +629,7 @@ fn sync_from_rejects_unlisted_host_without_requests_or_bypass_flag() {
             .arg("sync-from")
             .arg("https://wiremock-rejected-sync.mnemosctl.test")
             .env("HOME", &temp_dir)
-            .env("MNEMOS_BASE", "http://unused.example")
+            .env("MNEMOS_BASE", "https://unused.example")
             .env("MNEMOS_API_KEY", "root-sentinel")
             .env_remove("MNEMOS_SYNC_HOSTS")
             .env(mock_key, &mocks)
@@ -580,6 +702,7 @@ fn sync_from_allowed_mock_records_token_bearing_requests() {
             "https://wiremock-allowed-sync.mnemosctl.test",
         )
         .env("MNEMOS_API_KEY", "root-sentinel")
+        .env("MNEMOS_ALLOW_INSECURE_TRANSPORT", "1")
         .env(mock_key, mocks)
         .env(format!("{mock_key}_REQUEST_LOG"), &request_log)
         .output()

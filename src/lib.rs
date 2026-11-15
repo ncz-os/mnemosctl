@@ -15,13 +15,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
-use tracing::debug;
+use tracing::{debug, warn};
 
 const DEFAULT_PAGE_SIZE: usize = 100;
 pub const MAX_SYNC_PAGE_SIZE: usize = 500;
 const BALANCED_SEARCH_LIMIT: usize = 100;
 const MAX_SYNC_SCAN_ATTEMPTS: usize = 5;
 const SYNC_HOSTS_ENV: &str = "MNEMOS_SYNC_HOSTS";
+const INSECURE_TRANSPORT_ENV: &str = "MNEMOS_ALLOW_INSECURE_TRANSPORT";
+static INSECURE_TRANSPORT_WARNED: std::sync::Once = std::sync::Once::new();
 static MOCK_RESPONSE_HITS: LazyLock<Mutex<HashMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -1499,6 +1501,8 @@ fn parse_endpoint_url(value: &str) -> Result<EndpointUrl> {
         .context("host URL has no usable port")?;
     let path = url.path().trim_end_matches('/').to_string();
 
+    enforce_secure_transport(url.scheme(), &host)?;
+
     Ok(EndpointUrl {
         scheme: url.scheme().to_string(),
         host,
@@ -1513,6 +1517,53 @@ pub fn parse_sync_host_arg(value: &str) -> std::result::Result<String, String> {
     parse_endpoint_url(value)
         .map(|endpoint| endpoint.to_string())
         .map_err(|error| format!("{error:#}"))
+}
+
+/// Fleet endpoints must use `https` unless the host is loopback, in which
+/// case plaintext `http` never leaves the machine. A plaintext `http` URL to
+/// any other host carries the bearer in the clear, so it is refused unless
+/// the operator explicitly opts in with `MNEMOS_ALLOW_INSECURE_TRANSPORT=1`
+/// (mirrors the mnemos-bridge-core client). The refusal happens during URL
+/// parsing, before any request is built or sent, and the opt-in logs a
+/// one-time process warning when taken.
+fn enforce_secure_transport(scheme: &str, host: &str) -> Result<()> {
+    if scheme != "http" || is_loopback_host(host) {
+        return Ok(());
+    }
+    if insecure_transport_opted_in() {
+        INSECURE_TRANSPORT_WARNED.call_once(|| {
+            warn!(
+                "MNEMOS_ALLOW_INSECURE_TRANSPORT=1: sending the MNEMOS bearer over \
+                 plaintext http to {host}"
+            );
+        });
+        return Ok(());
+    }
+    bail!(
+        "refusing to send the MNEMOS bearer over plaintext http to non-loopback host \
+         {host:?}; use https, a loopback address, or set \
+         MNEMOS_ALLOW_INSECURE_TRANSPORT=1 for the trusted LAN"
+    )
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    if host == "localhost" || host == "localhost." {
+        return true;
+    }
+    if host == "::1" || host == "0:0:0:0:0:0:0:1" {
+        return true;
+    }
+    if let Ok(addr) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+        return addr.is_loopback();
+    }
+    false
+}
+
+fn insecure_transport_opted_in() -> bool {
+    env::var(INSECURE_TRANSPORT_ENV)
+        .ok()
+        .and_then(non_empty)
+        .is_some_and(|value| value == "1")
 }
 
 fn sync_host_allowlist() -> Result<Vec<String>> {
@@ -2003,6 +2054,65 @@ mod tests {
         server.abort();
         assert!(error.is_timeout());
         Ok(())
+    }
+
+    #[test]
+    fn plaintext_http_to_non_loopback_host_is_refused_without_opt_in() {
+        let _guard = insecure_transport_env_lock();
+        unsafe { env::remove_var("MNEMOS_ALLOW_INSECURE_TRANSPORT") };
+        for target in [
+            "http://10.0.0.5:5002",
+            "http://192.168.1.20:5002",
+            "http://mnemos.example/v1",
+            "http://[fd00::1]:5002",
+        ] {
+            let error = parse_endpoint_url(target)
+                .expect_err("plaintext http to a non-loopback host must be refused")
+                .to_string();
+            assert!(
+                error.contains("MNEMOS_ALLOW_INSECURE_TRANSPORT"),
+                "refusal of {target} must name the opt-in: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn plaintext_http_opt_in_allows_non_loopback_hosts() {
+        let _guard = insecure_transport_env_lock();
+        unsafe { env::set_var("MNEMOS_ALLOW_INSECURE_TRANSPORT", "1") };
+        let endpoint = parse_endpoint_url("http://10.0.0.5:5002");
+        unsafe { env::remove_var("MNEMOS_ALLOW_INSECURE_TRANSPORT") };
+        assert_eq!(
+            endpoint.expect("opt-in must allow").to_string(),
+            "http://10.0.0.5:5002"
+        );
+    }
+
+    #[test]
+    fn https_and_loopback_http_need_no_opt_in() {
+        let _guard = insecure_transport_env_lock();
+        unsafe { env::remove_var("MNEMOS_ALLOW_INSECURE_TRANSPORT") };
+        for target in [
+            "https://10.0.0.5:5002",
+            "https://mnemos.example",
+            "http://127.0.0.1:5002",
+            "http://localhost:5002",
+            "http://[::1]:5002",
+        ] {
+            parse_endpoint_url(target)
+                .unwrap_or_else(|error| panic!("{target} must stay allowed: {error:#}"));
+        }
+    }
+
+    /// Serializes the tests that mutate `MNEMOS_ALLOW_INSECURE_TRANSPORT`:
+    /// `cargo test` runs `#[test]` fns on threads of one process, so an
+    /// unsynchronized `set_var` in one test can leak into another.
+    #[cfg(test)]
+    fn insecure_transport_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV_MUTEX
+            .lock()
+            .expect("insecure-transport env lock poisoned")
     }
 
     #[cfg(unix)]
