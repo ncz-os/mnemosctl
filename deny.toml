@@ -1,6 +1,13 @@
 # cargo-deny config for the ncz-os Rust quality gate. Schema v2.
 [advisories]
 version = 2
+# No ignore entries are in use: every advisory reported by `cargo deny check`
+# is resolved by a dependency upgrade in Cargo.lock. If an advisory ever has no
+# available fix, add a scoped entry here instead of disabling the check:
+#   { id = "RUSTSEC-YYYY-NNNN", crate = "name", reason = "...", text = "...",
+#     review-by = "YYYY-MM-DD" }
+# with the reason limited to a neutral statement of why this project is not
+# affected, plus a review-by date.
 ignore = []
 
 [licenses]
